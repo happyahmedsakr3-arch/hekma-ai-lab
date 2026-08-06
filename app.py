@@ -41,13 +41,22 @@ PROMPT = """
 القواعد:
 1. لا تخمن. أي قيمة غير واضحة = null.
 2. فرّق بين رقم العميل وMember ID ورقم الكارنيه ورقم الوثيقة حسب العنوان المطبوع.
-3. استخرج الاسم العربي من البطاقة، وإن كان الاسم على الكارنيه بالإنجليزية فقط فاكتبه بالعربية كتابة صوتية محافظة.
-4. استخرج الرقم القومي فقط إذا كان كاملًا وواضحًا.
+3. استخرج الاسم العربي من البطاقة. إذا كان الاسم بالإنجليزية فقط، اكتبه بالعربية كتابة صوتية محافظة مع درجة ثقة مناسبة.
+4. استخرج الرقم القومي المصري فقط إذا كان كاملًا وواضحًا.
 5. حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم.
-6. قارن اسم البطاقة باسم الكارنيه.
+6. قارن اسم البطاقة باسم الكارنيه عند وجود الصورتين.
 7. لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
-8. أرجع نتيجة منظمة فقط.
+8. لا تعتبر الباركود أو الأرقام الصغيرة رقم كارنيه إلا إذا دلّ موضعها أو عنوانها على ذلك.
+9. أرجع نتيجة منظمة فقط.
 """
+
+
+def get_api_key() -> str:
+    try:
+        secret_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        secret_key = ""
+    return secret_key or os.getenv("OPENAI_API_KEY", "")
 
 
 def data_url(uploaded_file) -> str:
@@ -74,7 +83,7 @@ def analyze(api_key: str, files) -> CardReaderResult:
         )
 
     response = client.responses.parse(
-        model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
         instructions=PROMPT,
         input=[{"role": "user", "content": content}],
         text_format=CardReaderResult,
@@ -109,9 +118,14 @@ st.title("🧠 Hekma AI")
 st.subheader("قارئ الكارنيه والبطاقة")
 st.caption("ارفع صورة الكارنيه وصورة البطاقة ثم اضغط تحليل")
 
+saved_api_key = get_api_key()
 with st.sidebar:
-    api_key = st.text_input("OpenAI API Key", type="password")
-    st.caption("المفتاح لا يُحفظ داخل GitHub")
+    if saved_api_key:
+        st.success("API متصل")
+        api_key = saved_api_key
+    else:
+        api_key = st.text_input("OpenAI API Key", type="password")
+        st.caption("المفتاح يُستخدم داخل الجلسة فقط")
 
 files = st.file_uploader(
     "اختر الصور",
@@ -127,7 +141,7 @@ if files:
 
 if st.button("تحليل البطاقات", type="primary", use_container_width=True):
     if not api_key:
-        st.error("اكتب API Key")
+        st.error("أضف OpenAI API Key أولًا")
     elif not files:
         st.error("ارفع صورة واحدة على الأقل")
     else:
