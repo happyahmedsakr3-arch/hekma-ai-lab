@@ -54,26 +54,29 @@ PROMPT = """
 2. فرّق بين رقم العميل وMember ID ورقم الكارنيه ورقم الوثيقة حسب العنوان المطبوع.
 3. استخرج الاسم العربي من البطاقة، والاسم الإنجليزي من كارنيه التأمين.
 4. الرقم القومي المصري لا يُقبل إلا إذا كان 14 رقمًا كاملًا وواضحًا.
-5. حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم.
-6. قارن الاسم العربي والإنجليزي عند وجود المستندين.
-7. لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
-8. راجع كل رقم خانة بخانة، ولا تضف أصفارًا أو تكرر رقمًا غير موجود.
-9. لا تعتبر كودًا مطبوعًا أو باركودًا رقم كارنيه دون دليل واضح من الموضع أو العنوان.
-10. أرجع نتيجة منظمة فقط.
+5. عند قراءة الرقم القومي، انسخه بنفس شكل الأرقام العربية المطبوعة على البطاقة دون تحويلها إلى أرقام إنجليزية.
+6. حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم.
+7. قارن الاسم العربي والإنجليزي عند وجود المستندين.
+8. لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
+9. راجع كل رقم خانة بخانة، ولا تضف أصفارًا أو تكرر رقمًا غير موجود.
+10. لا تعتبر كودًا مطبوعًا أو باركودًا رقم كارنيه دون دليل واضح من الموضع أو العنوان.
+11. أرجع نتيجة منظمة فقط.
 """
 
 CRITICAL_PROMPT = """
-مهمتك الوحيدة قراءة ثلاثة أرقام حساسة من الصور بدقة حرفية:
-1) الرقم القومي المصري: 14 رقمًا فقط من بطاقة الرقم القومي.
-2) Member ID: الرقم المكتوب بجوار ID أو Member ID على كارنيه التأمين.
-3) Card Number: الرقم الآخر المطبوع على كارنيه التأمين، وليس Member ID.
+مهمتك OCR حرفي فقط لثلاثة أرقام حساسة:
+1) الرقم القومي المصري الموجود في السطر السفلي الثابت ببطاقة الرقم القومي.
+2) Member ID المكتوب بجوار ID أو Member ID على كارنيه التأمين.
+3) Card Number وهو الرقم الآخر المطبوع على كارنيه التأمين.
 
-قواعد إلزامية:
-- اقرأ كل رقم رقمًا رقمًا من اليسار إلى اليمين.
-- لا تستنتج رقمًا غير ظاهر.
-- لا تكرر رقمًا بسبب تشويش أو ظل.
-- لا تحوّل 0 إلى 8 أو 8 إلى 0 إلا إذا كان الشكل واضحًا.
-- الرقم القومي يجب أن يكون 14 رقمًا؛ غير ذلك null.
+تعليمات الرقم القومي:
+- انقله كما هو مطبوع بالأرقام العربية: ٠١٢٣٤٥٦٧٨٩.
+- لا تحوّله إلى 0123456789.
+- اقرأ الخانات الأربع عشرة واحدة واحدة من اليمين إلى اليسار كما تظهر بصريًا، ثم أرجع السلسلة المطبوعة نفسها.
+- تجاهل أي كود لاتيني مثل LG أو باركود أو رقم تسلسلي آخر.
+
+تعليمات جميع الأرقام:
+- لا تستنتج، لا تصحح، لا تضف ولا تحذف ولا تكرر رقمًا.
 - عند الشك أرجع null بدل التخمين.
 - أرجع النتيجة المنظمة فقط.
 """
@@ -87,6 +90,8 @@ GOVERNORATES = {
     "28": "أسوان", "29": "الأقصر", "31": "البحر الأحمر", "32": "الوادي الجديد",
     "33": "مطروح", "34": "شمال سيناء", "35": "جنوب سيناء", "88": "خارج الجمهورية",
 }
+
+ARABIC_TO_LATIN = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
 
 def get_api_key() -> str:
@@ -129,7 +134,7 @@ def read_critical_numbers(api_key: str, files, round_number: int) -> CriticalNum
         instructions=CRITICAL_PROMPT,
         input=[{
             "role": "user",
-            "content": image_content(files, f"قراءة مستقلة رقم {round_number}. افحص الأرقام الحساسة فقط وبأقصى تكبير بصري ممكن."),
+            "content": image_content(files, f"قراءة حرفية مستقلة رقم {round_number}. انسخ سطر الرقم القومي العربي كما هو، ثم اقرأ رقمي التأمين."),
         }],
         text_format=CriticalNumbers,
     )
@@ -138,21 +143,31 @@ def read_critical_numbers(api_key: str, files, round_number: int) -> CriticalNum
     return response.output_parsed
 
 
-def digits(value: str | None) -> str | None:
+def normalized_digits(value: str | None) -> str | None:
     if not value:
         return None
-    cleaned = re.sub(r"\D", "", value)
+    translated = value.translate(ARABIC_TO_LATIN)
+    cleaned = re.sub(r"\D", "", translated)
     return cleaned or None
 
 
+def exact_display(value: str | None) -> str | None:
+    if not value:
+        return None
+    return re.sub(r"[\s\-–—]", "", value)
+
+
 def consensus(first: str | None, second: str | None) -> str | None:
-    a, b = digits(first), digits(second)
-    return a if a and a == b else None
+    a = normalized_digits(first)
+    b = normalized_digits(second)
+    if not a or a != b:
+        return None
+    return exact_display(first)
 
 
 def verify_national_id(value: str | None) -> dict:
     info = {"valid_structure": False, "birth_date": None, "age": None, "gender": None, "governorate": None, "note": None}
-    national_id = digits(value)
+    national_id = normalized_digits(value)
     if not national_id or len(national_id) != 14:
         info["note"] = "الرقم القومي غير مؤكد أو ليس 14 رقمًا"
         return info
@@ -211,7 +226,7 @@ if st.button("تحليل وتدقيق الأرقام", type="primary", use_conta
         st.error("ارفع صورة واحدة على الأقل")
     else:
         try:
-            with st.spinner("جاري التحليل ثم إعادة قراءة الأرقام مرتين..."):
+            with st.spinner("جاري نسخ الرقم القومي العربي حرفيًا وتدقيق أرقام التأمين..."):
                 result = analyze(api_key, files)
                 pass1 = read_critical_numbers(api_key, files, 1)
                 pass2 = read_critical_numbers(api_key, files, 2)
@@ -241,7 +256,7 @@ if result and pass1 and pass2:
         c1, c2 = st.columns(2)
         with c1:
             show_field("الاسم بالعربي", result.patient_name_ar, "name_ar")
-            national_value = st.text_input("الرقم القومي المؤكد", value=verified_national_id or "", key="verified_nid")
+            st.text_input("الرقم القومي كما هو مكتوب بالعربي", value=verified_national_id or "", key="verified_nid")
             st.text_input("النوع", value=verification["gender"] or "غير مؤكد")
         with c2:
             show_field("الاسم بالإنجليزي", result.patient_name_en, "name_en")
@@ -260,7 +275,7 @@ if result and pass1 and pass2:
             show_field("تاريخ الانتهاء", result.expiry_date, "expiry")
 
     with audit_tab:
-        st.write("القراءة الأولى مقابل الثانية")
+        st.write("القراءة الحرفية الأولى مقابل الثانية")
         st.dataframe({
             "الحقل": ["الرقم القومي", "Member ID", "رقم الكارنيه"],
             "القراءة الأولى": [pass1.national_id, pass1.member_id, pass1.card_number],
@@ -268,7 +283,7 @@ if result and pass1 and pass2:
             "النتيجة المؤكدة": [verified_national_id, verified_member_id, verified_card_number],
         }, use_container_width=True)
         if not verified_national_id:
-            st.error("الرقم القومي لم يتطابق في القراءتين؛ ارفع لقطة أقرب للرقم فقط")
+            st.error("الرقم القومي العربي لم يتطابق حرفيًا في القراءتين؛ ارفع لقطة أقرب للسطر السفلي فقط")
         if not verified_card_number:
             st.error("رقم الكارنيه لم يتطابق في القراءتين؛ ارفع لقطة أقرب لرقم الكارنيه فقط")
         if verification["valid_structure"]:
@@ -282,7 +297,8 @@ if result and pass1 and pass2:
             "critical_pass_1": pass1.model_dump(),
             "critical_pass_2": pass2.model_dump(),
             "verified": {
-                "national_id": verified_national_id,
+                "national_id_arabic": verified_national_id,
+                "national_id_normalized": normalized_digits(verified_national_id),
                 "member_id": verified_member_id,
                 "card_number": verified_card_number,
             },
