@@ -2,6 +2,7 @@ import base64
 import io
 import os
 import re
+from collections import Counter
 from datetime import date
 from typing import Literal
 
@@ -34,21 +35,40 @@ class ReaderResult(BaseModel):
     summary_ar: str
 
 
+class NationalIdReads(BaseModel):
+    original_read: str | None = None
+    grayscale_read: str | None = None
+    threshold_read: str | None = None
+    confidence: int = Field(default=0, ge=0, le=100)
+    note: str | None = None
+
+
 PROMPT = """
-أنت محرك تدقيق مستندات طبية. ستستقبل صورًا أصلية وصورًا محسنة وقصاصة مخصصة لسطر الرقم القومي.
+أنت محرك تدقيق مستندات طبية.
 
 قواعد إلزامية:
 1. استخدم الصورة الأصلية لفهم نوع المستند والأسماء والشركة.
 2. استخدم الصورة المحسنة للأرقام المطبوعة على كارنيه التأمين.
-3. استخدم قصاصة الرقم القومي فقط لقراءة الرقم القومي.
-4. الرقم القومي لا يُقبل إلا إذا كان 14 رقمًا واضحًا. عند أي شك أرجع null.
-5. لا تخمن أي رقم، ولا تكمل أرقامًا ناقصة من السياق.
-6. لا تعتبر الكود اللاتيني أسفل البطاقة رقمًا قوميًا.
-7. Member ID هو الرقم بجوار ID أو Member ID فقط.
-8. Card Number هو الرقم بجوار Card Number فقط. إن لم يوجد عنوان واضح أرجع null.
-9. فرّق بين Policy No وCard Number وMember ID.
-10. حدّد صلاحية الكارنيه من تاريخ الانتهاء مقارنة بتاريخ اليوم.
-11. أرجع نتيجة منظمة فقط.
+3. لا تعتمد الرقم القومي من التحليل العام؛ سيُقرأ في مرحلة مستقلة.
+4. لا تخمن أي رقم، ولا تكمل أرقامًا ناقصة من السياق.
+5. Member ID هو الرقم بجوار ID أو Member ID فقط.
+6. Card Number هو الرقم بجوار Card Number فقط. إن لم يوجد عنوان واضح أرجع null.
+7. فرّق بين Policy No وCard Number وMember ID.
+8. حدّد صلاحية الكارنيه من تاريخ الانتهاء مقارنة بتاريخ اليوم.
+9. أرجع نتيجة منظمة فقط.
+"""
+
+NATIONAL_ID_PROMPT = """
+أنت آلة نسخ أرقام فقط، وليست مهمتك تفسير الصورة.
+سترى ثلاث نسخ لنفس سطر الرقم القومي المصري: أصلية، رمادية عالية التباين، وأبيض/أسود.
+
+لكل نسخة:
+- انسخ 14 رقمًا كما تظهر بصريًا فقط.
+- حوّل الأرقام العربية المطبوعة إلى أرقام 0-9 في الناتج.
+- لا تستخدم الاسم أو تاريخ الميلاد أو أي سياق لتخمين رقم.
+- تجاهل الكود اللاتيني أسفل البطاقة.
+- إذا لم تستطع تمييز 14 خانة كاملة في نسخة ما، أرجع null لهذه النسخة.
+- لا تُصلح رقمًا ولا تستنتج رقمًا ناقصًا.
 """
 
 ARABIC_TO_LATIN = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -61,7 +81,7 @@ def api_key() -> str:
         return os.getenv("OPENAI_API_KEY", "")
 
 
-def image_to_data_url(image: Image.Image, quality: int = 95) -> str:
+def image_to_data_url(image: Image.Image, quality: int = 96) -> str:
     buffer = io.BytesIO()
     image.convert("RGB").save(buffer, format="JPEG", quality=quality, optimize=True)
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -73,30 +93,37 @@ def open_uploaded(uploaded_file) -> Image.Image:
 
 
 def enhance_document(image: Image.Image) -> Image.Image:
-    max_side = 2200
+    max_side = 2400
     scale = min(max_side / max(image.size), 1.0)
     if scale < 1.0:
         image = image.resize((int(image.width * scale), int(image.height * scale)), Image.Resampling.LANCZOS)
-
     gray = ImageOps.grayscale(image)
     gray = ImageOps.autocontrast(gray, cutoff=1)
-    gray = ImageEnhance.Contrast(gray).enhance(1.8)
-    gray = ImageEnhance.Sharpness(gray).enhance(2.2)
-    gray = gray.filter(ImageFilter.UnsharpMask(radius=1.8, percent=170, threshold=3))
-    return gray.convert("RGB")
+    gray = ImageEnhance.Contrast(gray).enhance(1.7)
+    gray = ImageEnhance.Sharpness(gray).enhance(2.0)
+    return gray.filter(ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=3)).convert("RGB")
 
 
-def national_id_crop(image: Image.Image) -> Image.Image:
-    # البطاقة المصرية يكون الرقم القومي غالبًا في الشريط السفلي يمين البطاقة.
+def national_id_crops(image: Image.Image) -> dict[str, Image.Image]:
     w, h = image.size
-    crop = image.crop((int(w * 0.32), int(h * 0.63), int(w * 0.99), int(h * 0.94)))
-    crop = crop.resize((crop.width * 4, crop.height * 4), Image.Resampling.LANCZOS)
-    crop = ImageOps.grayscale(crop)
-    crop = ImageOps.autocontrast(crop, cutoff=1)
-    crop = ImageEnhance.Contrast(crop).enhance(2.4)
-    crop = ImageEnhance.Sharpness(crop).enhance(3.0)
-    crop = crop.filter(ImageFilter.UnsharpMask(radius=2, percent=220, threshold=2))
-    return crop.convert("RGB")
+    base = image.crop((int(w * 0.30), int(h * 0.64), int(w * 0.995), int(h * 0.93)))
+    base = base.resize((max(base.width * 6, 1800), max(base.height * 6, 360)), Image.Resampling.LANCZOS)
+
+    original = ImageEnhance.Sharpness(base).enhance(1.8).convert("RGB")
+
+    gray = ImageOps.grayscale(base)
+    gray = ImageOps.autocontrast(gray, cutoff=0.5)
+    gray = ImageEnhance.Contrast(gray).enhance(2.2)
+    gray = gray.filter(ImageFilter.UnsharpMask(radius=1.6, percent=220, threshold=2))
+
+    threshold = gray.point(lambda p: 255 if p > 150 else 0)
+    threshold = threshold.filter(ImageFilter.MedianFilter(size=3))
+
+    return {
+        "id_crop_original": original,
+        "id_crop_grayscale": gray.convert("RGB"),
+        "id_crop_threshold": threshold.convert("RGB"),
+    }
 
 
 def normalized_digits(value: str | None) -> str | None:
@@ -106,51 +133,86 @@ def normalized_digits(value: str | None) -> str | None:
     return cleaned or None
 
 
-def strict_national_id(value: str | None) -> str | None:
+def structurally_valid_national_id(value: str | None) -> bool:
     cleaned = normalized_digits(value)
     if not cleaned or len(cleaned) != 14 or cleaned[0] not in {"2", "3"}:
-        return None
+        return False
     try:
         century = 1900 if cleaned[0] == "2" else 2000
-        date(century + int(cleaned[1:3]), int(cleaned[3:5]), int(cleaned[5:7]))
+        birth = date(century + int(cleaned[1:3]), int(cleaned[3:5]), int(cleaned[5:7]))
+        return birth <= date.today()
     except ValueError:
+        return False
+
+
+def vote_national_id(reads: NationalIdReads) -> str | None:
+    candidates = [
+        normalized_digits(reads.original_read),
+        normalized_digits(reads.grayscale_read),
+        normalized_digits(reads.threshold_read),
+    ]
+    valid = [item for item in candidates if structurally_valid_national_id(item)]
+    if not valid:
         return None
-    return cleaned
+    counts = Counter(valid)
+    value, votes = counts.most_common(1)[0]
+    return value if votes >= 2 else None
 
 
-def analyze_documents(key: str, insurance_file, id_file) -> tuple[ReaderResult, dict[str, Image.Image]]:
+def read_national_id(key: str, crops: dict[str, Image.Image]) -> NationalIdReads:
+    content = [
+        {"type": "input_text", "text": "اقرأ كل نسخة مستقلة ثم أرجع القراءات الثلاث."},
+        {"type": "input_text", "text": "النسخة الأصلية المكبرة:"},
+        {"type": "input_image", "image_url": image_to_data_url(crops["id_crop_original"]), "detail": "high"},
+        {"type": "input_text", "text": "النسخة الرمادية عالية التباين:"},
+        {"type": "input_image", "image_url": image_to_data_url(crops["id_crop_grayscale"]), "detail": "high"},
+        {"type": "input_text", "text": "نسخة الأبيض والأسود:"},
+        {"type": "input_image", "image_url": image_to_data_url(crops["id_crop_threshold"]), "detail": "high"},
+    ]
+    client = OpenAI(api_key=key)
+    response = client.responses.parse(
+        model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
+        instructions=NATIONAL_ID_PROMPT,
+        input=[{"role": "user", "content": content}],
+        text_format=NationalIdReads,
+    )
+    if response.output_parsed is None:
+        raise RuntimeError("تعذر قراءة الرقم القومي")
+    return response.output_parsed
+
+
+def analyze_documents(key: str, insurance_file, id_file):
     insurance_original = open_uploaded(insurance_file) if insurance_file else None
     id_original = open_uploaded(id_file) if id_file else None
-
     prepared: dict[str, Image.Image] = {}
     content: list[dict] = [{
         "type": "input_text",
-        "text": f"حلل المستندات التالية. تاريخ اليوم {date.today().isoformat()}. كل صورة مسبوقة بوصف يحدد وظيفتها.",
+        "text": f"حلل المستندات التالية. تاريخ اليوم {date.today().isoformat()}.",
     }]
 
     if insurance_original:
         insurance_enhanced = enhance_document(insurance_original)
         prepared["insurance_enhanced"] = insurance_enhanced
         content.extend([
-            {"type": "input_text", "text": "صورة كارنيه التأمين الأصلية:"},
+            {"type": "input_text", "text": "كارنيه التأمين الأصلي:"},
             {"type": "input_image", "image_url": image_to_data_url(insurance_original), "detail": "high"},
-            {"type": "input_text", "text": "نسخة محسنة من كارنيه التأمين لقراءة الأرقام والعناوين:"},
+            {"type": "input_text", "text": "كارنيه التأمين المحسن:"},
             {"type": "input_image", "image_url": image_to_data_url(insurance_enhanced), "detail": "high"},
         ])
 
+    id_reads = None
+    verified_national_id = None
     if id_original:
         id_enhanced = enhance_document(id_original)
-        id_number_crop = national_id_crop(id_original)
+        crops = national_id_crops(id_original)
         prepared["id_enhanced"] = id_enhanced
-        prepared["id_number_crop"] = id_number_crop
+        prepared.update(crops)
         content.extend([
-            {"type": "input_text", "text": "صورة بطاقة الرقم القومي الأصلية:"},
+            {"type": "input_text", "text": "بطاقة الرقم القومي الأصلية؛ استخرج الاسم فقط ولا تقرأ الرقم القومي هنا:"},
             {"type": "input_image", "image_url": image_to_data_url(id_original), "detail": "high"},
-            {"type": "input_text", "text": "نسخة محسنة من بطاقة الرقم القومي:"},
-            {"type": "input_image", "image_url": image_to_data_url(id_enhanced), "detail": "high"},
-            {"type": "input_text", "text": "قصاصة مخصصة لسطر الرقم القومي فقط. اقرأ منها 14 رقمًا أو أرجع null:"},
-            {"type": "input_image", "image_url": image_to_data_url(id_number_crop), "detail": "high"},
         ])
+        id_reads = read_national_id(key, crops)
+        verified_national_id = vote_national_id(id_reads)
 
     client = OpenAI(api_key=key)
     response = client.responses.parse(
@@ -161,17 +223,22 @@ def analyze_documents(key: str, insurance_file, id_file) -> tuple[ReaderResult, 
     )
     if response.output_parsed is None:
         raise RuntimeError("لم يتم استخراج نتيجة منظمة")
-    return response.output_parsed, prepared
+
+    result = response.output_parsed
+    result.national_id.value = verified_national_id
+    result.national_id.confidence = id_reads.confidence if verified_national_id and id_reads else 0
+    if not verified_national_id and id_original:
+        result.warnings.append("لم تتفق نسختان من أصل ثلاث على الرقم القومي؛ تُرك فارغًا بدل عرض رقم خاطئ")
+    return result, prepared, id_reads
 
 
-st.set_page_config(page_title="Hekma AI V2", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Hekma AI V2.1", page_icon="🧠", layout="wide")
 st.markdown(
     "<style>html,body,[class*='css']{direction:rtl;text-align:right}.block-container{max-width:1150px;padding-top:2rem}</style>",
     unsafe_allow_html=True,
 )
-
-st.title("🧠 Hekma AI — Vision Pipeline V2")
-st.caption("ارفع الكارنيه والبطاقة في خانات منفصلة. النظام يحسن الصور ويقص منطقة الرقم القومي تلقائيًا.")
+st.title("🧠 Hekma AI — Vision Pipeline V2.1")
+st.caption("ثلاث معالجات مستقلة للرقم القومي، ولا يتم اعتماده إلا بتطابق قراءتين على الأقل.")
 
 with st.sidebar:
     st.success("API متصل") if api_key() else st.error("API غير متصل")
@@ -191,32 +258,32 @@ if insurance_file or id_file:
         with p2:
             st.image(id_file, caption="بطاقة الرقم القومي الأصلية", use_container_width=True)
 
-if st.button("تحليل V2", type="primary", use_container_width=True):
+if st.button("تحليل V2.1", type="primary", use_container_width=True):
     if not api_key():
         st.error("مفتاح OpenAI غير موجود")
     elif not insurance_file and not id_file:
         st.error("ارفع مستندًا واحدًا على الأقل")
     else:
         try:
-            with st.spinner("جاري تحسين الصور، قص مناطق الأرقام، ثم التحليل..."):
-                result, prepared = analyze_documents(api_key(), insurance_file, id_file)
-                result.national_id.value = strict_national_id(result.national_id.value)
-                if not result.national_id.value:
-                    result.national_id.confidence = 0
-                    result.warnings.append("الرقم القومي لم ينجح في التحقق الصارم؛ تم تركه فارغًا بدل عرض رقم خاطئ")
-                st.session_state.result_v2 = result
-                st.session_state.prepared_v2 = prepared
+            with st.spinner("جاري تجهيز ثلاث نسخ للرقم القومي وتحليل المستندات..."):
+                result, prepared, id_reads = analyze_documents(api_key(), insurance_file, id_file)
+                st.session_state.result_v21 = result
+                st.session_state.prepared_v21 = prepared
+                st.session_state.id_reads_v21 = id_reads
         except Exception as exc:
             st.error(f"فشل التحليل: {exc}")
 
-result = st.session_state.get("result_v2")
-prepared = st.session_state.get("prepared_v2", {})
+result = st.session_state.get("result_v21")
+prepared = st.session_state.get("prepared_v21", {})
+id_reads = st.session_state.get("id_reads_v21")
 
 if result:
     st.success(result.summary_ar)
     st.subheader({"valid": "🟢 الكارنيه ساري", "expired": "🔴 الكارنيه منتهي", "unknown": "🟡 الصلاحية غير واضحة"}[result.card_status])
 
-    patient_tab, insurance_tab, processing_tab, json_tab = st.tabs(["بيانات المريض", "بيانات التأمين", "معالجة الصور", "JSON"])
+    patient_tab, insurance_tab, audit_tab, processing_tab, json_tab = st.tabs([
+        "بيانات المريض", "بيانات التأمين", "تدقيق الرقم القومي", "معالجة الصور", "JSON"
+    ])
 
     with patient_tab:
         c1, c2 = st.columns(2)
@@ -224,7 +291,7 @@ if result:
         c2.text_input("الاسم بالإنجليزي", value=result.patient_name_en.value or "")
         st.text_input("الرقم القومي المؤكد", value=result.national_id.value or "")
         if not result.national_id.value:
-            st.error("الرقم القومي غير مؤكد. ارفع صورة أقرب للبطاقة بدل اعتماد رقم خاطئ.")
+            st.error("الرقم القومي غير مؤكد؛ لم يتم اعتماد أي تخمين.")
 
     with insurance_tab:
         c1, c2 = st.columns(2)
@@ -236,17 +303,28 @@ if result:
         c2.text_input("الفئة / الشبكة", value=result.network_class.value or "")
         st.text_input("تاريخ الانتهاء", value=result.expiry_date.value or "")
 
+    with audit_tab:
+        if id_reads:
+            st.dataframe({
+                "المعالجة": ["الأصلية المكبرة", "رمادية عالية التباين", "أبيض وأسود"],
+                "القراءة": [id_reads.original_read, id_reads.grayscale_read, id_reads.threshold_read],
+            }, use_container_width=True)
+            st.caption(id_reads.note or "")
+        else:
+            st.info("لم يتم رفع بطاقة رقم قومي")
+
     with processing_tab:
         if prepared:
             cols = st.columns(min(len(prepared), 3))
             for index, (name, image) in enumerate(prepared.items()):
                 with cols[index % len(cols)]:
                     st.image(image, caption=name, use_container_width=True)
-        else:
-            st.info("لا توجد صور معالجة بعد")
 
     with json_tab:
-        st.json(result.model_dump())
+        st.json({
+            "result": result.model_dump(),
+            "national_id_reads": id_reads.model_dump() if id_reads else None,
+        })
 
     if result.warnings:
         st.warning("\n".join(f"• {item}" for item in dict.fromkeys(result.warnings)))
