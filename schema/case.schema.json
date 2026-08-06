@@ -1,0 +1,43 @@
+{
+  "version": "1.0",
+  "case_id": null,
+  "analysis_time": null,
+  "overall_confidence": 0,
+
+  "patient": {
+    "arabic_name": null,
+    "english_name": null,
+    "national_id": null,
+    "gender": null,
+    "date_of_birth": null
+  },
+
+  "insurance": {
+    "company": null,
+    "member_id": null,
+    "card_number": null,
+    "policy_number": null,
+    "network": null,
+    "expiry_date": null,
+    "status": "unknown"
+  },
+
+  "doctor": {
+    "name": null,
+    "specialty": null
+  },
+
+  "medical": {
+    "diagnosis": null,
+    "requested_service": null,
+    "clinical_summary": null
+  },
+
+  "documents": [],
+
+  "missing_documents": [],
+
+  "warnings": [],
+
+  "sources": {}
+}
