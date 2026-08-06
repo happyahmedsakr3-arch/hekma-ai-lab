@@ -1,5 +1,4 @@
 import base64
-import os
 from datetime import date
 from typing import Literal
 
@@ -14,197 +13,131 @@ class ExtractedField(BaseModel):
     source: str | None = None
 
 
-class PatientData(BaseModel):
-    arabic_name: ExtractedField
-    english_name: ExtractedField
+class CardReaderResult(BaseModel):
+    patient_name_ar: ExtractedField
+    patient_name_en: ExtractedField
     national_id: ExtractedField
     date_of_birth: ExtractedField
     gender: ExtractedField
-
-
-class InsuranceData(BaseModel):
-    company: ExtractedField
+    insurance_company: ExtractedField
     customer_number: ExtractedField
     member_id: ExtractedField
     card_number: ExtractedField
     policy_number: ExtractedField
+    employer: ExtractedField
     network_class: ExtractedField
+    valid_from: ExtractedField
     expiry_date: ExtractedField
     card_status: Literal["valid", "expired", "unknown"]
-
-
-class DoctorRequest(BaseModel):
-    doctor_name: ExtractedField
-    specialty: ExtractedField
-    diagnosis: ExtractedField
-    requested_service: ExtractedField
-    handwritten_text: ExtractedField
-    unclear_words: list[str]
-
-
-class CaseResult(BaseModel):
-    patient: PatientData
-    insurance: InsuranceData
-    doctor_request: DoctorRequest
+    names_match: Literal["match", "possible_match", "mismatch", "unknown"]
     warnings: list[str]
     summary_ar: str
 
 
-SYSTEM_PROMPT = """
-أنت Hekma AI، مساعد متخصص في قراءة مستندات الموافقات الطبية المصرية.
-حلّل الصور المرفوعة باعتبارها قد تشمل كارنيه تأمين، بطاقة رقم قومي، وطلب طبيب بخط اليد.
+PROMPT = """
+أنت قارئ شديد الدقة لكارنيهات التأمين الطبي وبطاقات الرقم القومي المصرية.
 
 القواعد:
-1) لا تخمّن. أي معلومة غير واضحة اجعلها null.
-2) اكتب الاسم العربي بالعربية إذا كان ممكنًا استخلاصه بأمان من البطاقة أو الاسم الإنجليزي؛ إن لم تكن متأكدًا اجعله null.
-3) فرّق بين رقم العميل، Member ID، رقم الكارنيه، ورقم الوثيقة حسب العناوين المطبوعة على المستند.
-4) استخرج الرقم القومي المصري من البطاقة فقط عندما يكون واضحًا بالكامل.
-5) حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم المرسل لك.
-6) اقرأ خط الطبيب قدر الإمكان، وحدد التشخيص والخدمة المطلوبة والكلمات غير الواضحة.
-7) لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
-8) لا تضف أعراضًا أو تشخيصات غير موجودة.
-9) اكتب ملخصًا عربيًا قصيرًا وواضحًا.
+1. لا تخمن. أي قيمة غير واضحة = null.
+2. فرّق بين رقم العميل وMember ID ورقم الكارنيه ورقم الوثيقة حسب العنوان المطبوع.
+3. استخرج الاسم العربي من البطاقة، وإن كان الاسم على الكارنيه بالإنجليزية فقط فاكتبه بالعربية كتابة صوتية محافظة.
+4. استخرج الرقم القومي فقط إذا كان كاملًا وواضحًا.
+5. حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم.
+6. قارن اسم البطاقة باسم الكارنيه.
+7. لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
+8. أرجع JSON منظم فقط.
 """
 
 
-def file_to_data_url(uploaded_file) -> str:
+def data_url(uploaded_file) -> str:
     encoded = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
     return f"data:{uploaded_file.type};base64,{encoded}"
 
 
-def analyze_case(api_key: str, uploaded_files) -> CaseResult:
+def analyze(api_key: str, files) -> CardReaderResult:
     client = OpenAI(api_key=api_key)
-    content = [
-        {
-            "type": "input_text",
-            "text": f"حلّل هذه المستندات. تاريخ اليوم: {date.today().isoformat()}",
-        }
-    ]
-
-    for uploaded_file in uploaded_files:
-        content.append(
-            {
-                "type": "input_image",
-                "image_url": file_to_data_url(uploaded_file),
-                "detail": "high",
-            }
-        )
+    content = [{"type": "input_text", "text": f"تاريخ اليوم: {date.today().isoformat()}"}]
+    for file in files:
+        content.append({"type": "input_image", "image_url": data_url(file), "detail": "high"})
 
     response = client.responses.parse(
-        model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
-        instructions=SYSTEM_PROMPT,
+        model="gpt-5.6",
+        instructions=PROMPT,
         input=[{"role": "user", "content": content}],
-        text_format=CaseResult,
+        text_format=CardReaderResult,
     )
-
     if response.output_parsed is None:
-        raise RuntimeError("لم يتم إرجاع نتيجة منظمة من النموذج.")
-
+        raise RuntimeError("لم يتم استخراج نتيجة منظمة")
     return response.output_parsed
 
 
-def show_field(label: str, field: ExtractedField) -> None:
-    value = field.value or "غير واضح"
-    st.text_input(
-        label,
-        value=value,
-        help=f"الثقة: {field.confidence}% | المصدر: {field.source or 'غير محدد'}",
-    )
+def field(label: str, item: ExtractedField) -> None:
+    st.text_input(label, value=item.value or "غير واضح", help=f"الثقة {item.confidence}% | المصدر: {item.source or 'غير محدد'}")
 
 
-st.set_page_config(page_title="Hekma AI Lab", page_icon="🧠", layout="wide")
-st.markdown(
-    """
-    <style>
-    html, body, [class*="css"] { direction: rtl; text-align: right; }
-    .block-container { max-width: 1200px; padding-top: 2rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title="Hekma Card Reader", page_icon="🪪", layout="wide")
+st.markdown("<style>html,body,[class*='css']{direction:rtl;text-align:right}.block-container{max-width:1100px;padding-top:2rem}</style>", unsafe_allow_html=True)
 
-st.title("🧠 Hekma AI Lab")
-st.caption("قارئ الكارنيه والبطاقة وطلب الطبيب — نسخة التجارب الأولى")
+st.title("🪪 Hekma Smart Card Reader")
+st.caption("ارفع كارنيه التأمين والبطاقة الشخصية")
 
 with st.sidebar:
-    st.header("الإعدادات")
     api_key = st.text_input("OpenAI API Key", type="password")
-    st.caption("المفتاح يُستخدم داخل الجلسة فقط ولا يُحفظ في GitHub.")
 
-uploaded_files = st.file_uploader(
-    "ارفع صور الكارنيه والبطاقة وطلب الطبيب",
-    type=["png", "jpg", "jpeg", "webp"],
-    accept_multiple_files=True,
-)
+files = st.file_uploader("اختر الصور", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
 
-if uploaded_files:
-    preview_columns = st.columns(min(len(uploaded_files), 4))
-    for index, uploaded_file in enumerate(uploaded_files):
-        with preview_columns[index % len(preview_columns)]:
-            st.image(uploaded_file, caption=uploaded_file.name, use_container_width=True)
+if files:
+    cols = st.columns(min(len(files), 4))
+    for i, file in enumerate(files):
+        with cols[i % len(cols)]:
+            st.image(file, caption=file.name, use_container_width=True)
 
-analyze_clicked = st.button("تحليل الحالة", type="primary", use_container_width=True)
-
-if analyze_clicked:
+if st.button("قراءة البطاقات", type="primary", use_container_width=True):
     if not api_key:
-        st.error("اكتب API Key أولًا.")
-    elif not uploaded_files:
-        st.error("ارفع صورة واحدة على الأقل.")
+        st.error("اكتب API Key")
+    elif not files:
+        st.error("ارفع صورة واحدة على الأقل")
     else:
         try:
-            with st.spinner("جاري قراءة المستندات وتحليلها..."):
-                result = analyze_case(api_key, uploaded_files)
-            st.session_state["result"] = result
+            with st.spinner("جاري القراءة..."):
+                st.session_state.result = analyze(api_key, files)
         except Exception as exc:
-            st.error(f"فشل التحليل: {exc}")
+            st.error(str(exc))
 
-result: CaseResult | None = st.session_state.get("result")
+result = st.session_state.get("result")
 if result:
+    status = {"valid": "🟢 الكارنيه ساري", "expired": "🔴 الكارنيه منتهي", "unknown": "🟡 الصلاحية غير واضحة"}[result.card_status]
     st.success(result.summary_ar)
+    st.subheader(status)
 
-    patient_tab, insurance_tab, doctor_tab, raw_tab = st.tabs(
-        ["بيانات المريض", "بيانات التأمين", "طلب الطبيب", "النتيجة الكاملة"]
-    )
+    tab1, tab2, tab3 = st.tabs(["بيانات المريض", "بيانات التأمين", "JSON"])
+    with tab1:
+        c1, c2 = st.columns(2)
+        with c1:
+            field("الاسم بالعربي", result.patient_name_ar)
+            field("الرقم القومي", result.national_id)
+            field("النوع", result.gender)
+        with c2:
+            field("الاسم بالإنجليزي", result.patient_name_en)
+            field("تاريخ الميلاد", result.date_of_birth)
+            st.text_input("تطابق الأسماء", value=result.names_match)
 
-    with patient_tab:
-        col1, col2 = st.columns(2)
-        with col1:
-            show_field("الاسم بالعربي", result.patient.arabic_name)
-            show_field("الرقم القومي", result.patient.national_id)
-            show_field("النوع", result.patient.gender)
-        with col2:
-            show_field("الاسم بالإنجليزي", result.patient.english_name)
-            show_field("تاريخ الميلاد", result.patient.date_of_birth)
+    with tab2:
+        c1, c2 = st.columns(2)
+        with c1:
+            field("شركة التأمين", result.insurance_company)
+            field("رقم العميل", result.customer_number)
+            field("رقم الكارنيه", result.card_number)
+            field("جهة العمل", result.employer)
+        with c2:
+            field("Member ID", result.member_id)
+            field("رقم الوثيقة", result.policy_number)
+            field("الفئة / الشبكة", result.network_class)
+            field("تاريخ البداية", result.valid_from)
+            field("تاريخ الانتهاء", result.expiry_date)
 
-    with insurance_tab:
-        status_text = {
-            "valid": "🟢 الكارنيه ساري",
-            "expired": "🔴 الكارنيه منتهي",
-            "unknown": "🟡 صلاحية الكارنيه غير واضحة",
-        }[result.insurance.card_status]
-        st.subheader(status_text)
-        col1, col2 = st.columns(2)
-        with col1:
-            show_field("شركة التأمين", result.insurance.company)
-            show_field("رقم العميل", result.insurance.customer_number)
-            show_field("رقم الكارنيه", result.insurance.card_number)
-            show_field("الفئة / الشبكة", result.insurance.network_class)
-        with col2:
-            show_field("Member ID", result.insurance.member_id)
-            show_field("رقم الوثيقة", result.insurance.policy_number)
-            show_field("تاريخ الانتهاء", result.insurance.expiry_date)
-
-    with doctor_tab:
-        show_field("اسم الطبيب", result.doctor_request.doctor_name)
-        show_field("التخصص", result.doctor_request.specialty)
-        show_field("التشخيص", result.doctor_request.diagnosis)
-        show_field("الخدمة المطلوبة", result.doctor_request.requested_service)
-        show_field("النص المكتوب بخط اليد", result.doctor_request.handwritten_text)
-        if result.doctor_request.unclear_words:
-            st.warning("كلمات غير واضحة: " + " — ".join(result.doctor_request.unclear_words))
-
-    with raw_tab:
+    with tab3:
         st.json(result.model_dump())
 
     if result.warnings:
-        st.warning("\n".join(f"• {warning}" for warning in result.warnings))
+        st.warning("\n".join(f"• {w}" for w in result.warnings))
