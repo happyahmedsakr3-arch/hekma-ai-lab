@@ -1,4 +1,5 @@
 import base64
+import io
 import os
 import re
 from datetime import date
@@ -6,6 +7,7 @@ from typing import Literal
 
 import streamlit as st
 from openai import OpenAI
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pydantic import BaseModel, Field
 
 
@@ -15,20 +17,16 @@ class ExtractedField(BaseModel):
     source: str | None = None
 
 
-class CardReaderResult(BaseModel):
+class ReaderResult(BaseModel):
     patient_name_ar: ExtractedField
     patient_name_en: ExtractedField
     national_id: ExtractedField
-    date_of_birth: ExtractedField
-    gender: ExtractedField
     insurance_company: ExtractedField
-    customer_number: ExtractedField
     member_id: ExtractedField
     card_number: ExtractedField
     policy_number: ExtractedField
     employer: ExtractedField
     network_class: ExtractedField
-    valid_from: ExtractedField
     expiry_date: ExtractedField
     card_status: Literal["valid", "expired", "unknown"]
     names_match: Literal["match", "possible_match", "mismatch", "unknown"]
@@ -36,308 +34,219 @@ class CardReaderResult(BaseModel):
     summary_ar: str
 
 
-class CriticalNumbers(BaseModel):
-    national_id: str | None = None
-    member_id: str | None = None
-    card_number: str | None = None
-    national_id_confidence: int = Field(default=0, ge=0, le=100)
-    member_id_confidence: int = Field(default=0, ge=0, le=100)
-    card_number_confidence: int = Field(default=0, ge=0, le=100)
-    notes: list[str] = []
-
-
 PROMPT = """
-أنت قارئ شديد الدقة لكارنيهات التأمين الطبي وبطاقات الرقم القومي المصرية.
-
-القواعد:
-1. لا تخمن. أي قيمة غير واضحة = null.
-2. فرّق بين رقم العميل وMember ID ورقم الكارنيه ورقم الوثيقة حسب العنوان المطبوع.
-3. استخرج الاسم العربي من البطاقة، والاسم الإنجليزي من كارنيه التأمين.
-4. لا تعتمد الرقم القومي أو Member ID أو رقم الكارنيه في التحليل العام؛ ستتم قراءتها في مرحلة مستقلة.
-5. حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم.
-6. قارن الاسم العربي والإنجليزي عند وجود المستندين.
-7. لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
-8. أرجع نتيجة منظمة فقط.
-"""
-
-CRITICAL_PROMPT = """
-مهمتك OCR حرفي فقط لثلاثة أرقام حساسة:
-1) الرقم القومي المصري الموجود في السطر السفلي الثابت ببطاقة الرقم القومي.
-2) Member ID المكتوب بجوار ID أو Member ID على كارنيه التأمين.
-3) Card Number وهو الرقم الآخر المطبوع على كارنيه التأمين.
+أنت محرك تدقيق مستندات طبية. ستستقبل صورًا أصلية وصورًا محسنة وقصاصة مخصصة لسطر الرقم القومي.
 
 قواعد إلزامية:
-- لا تستنتج ولا تصحح ولا تكمل رقمًا ناقصًا.
-- إذا كانت أي خانة غير واضحة أرجع null لذلك الرقم كله.
-- الرقم القومي لا يُقبل إلا إذا رأيت 14 خانة كاملة بوضوح شديد.
-- اقرأ الرقم القومي كما هو مطبوع بالأرقام العربية.
-- تجاهل أي كود لاتيني مثل LG أو باركود أو رقم تسلسلي آخر.
-- لا تمنح ثقة 98 أو أكثر إلا إذا كانت كل الخانات واضحة دون لبس.
-- أرجع النتيجة المنظمة فقط.
+1. استخدم الصورة الأصلية لفهم نوع المستند والأسماء والشركة.
+2. استخدم الصورة المحسنة للأرقام المطبوعة على كارنيه التأمين.
+3. استخدم قصاصة الرقم القومي فقط لقراءة الرقم القومي.
+4. الرقم القومي لا يُقبل إلا إذا كان 14 رقمًا واضحًا. عند أي شك أرجع null.
+5. لا تخمن أي رقم، ولا تكمل أرقامًا ناقصة من السياق.
+6. لا تعتبر الكود اللاتيني أسفل البطاقة رقمًا قوميًا.
+7. Member ID هو الرقم بجوار ID أو Member ID فقط.
+8. Card Number هو الرقم بجوار Card Number فقط. إن لم يوجد عنوان واضح أرجع null.
+9. فرّق بين Policy No وCard Number وMember ID.
+10. حدّد صلاحية الكارنيه من تاريخ الانتهاء مقارنة بتاريخ اليوم.
+11. أرجع نتيجة منظمة فقط.
 """
 
-GOVERNORATES = {
-    "01": "القاهرة", "02": "الإسكندرية", "03": "بورسعيد", "04": "السويس",
-    "11": "دمياط", "12": "الدقهلية", "13": "الشرقية", "14": "القليوبية",
-    "15": "كفر الشيخ", "16": "الغربية", "17": "المنوفية", "18": "البحيرة",
-    "19": "الإسماعيلية", "21": "الجيزة", "22": "بني سويف", "23": "الفيوم",
-    "24": "المنيا", "25": "أسيوط", "26": "سوهاج", "27": "قنا",
-    "28": "أسوان", "29": "الأقصر", "31": "البحر الأحمر", "32": "الوادي الجديد",
-    "33": "مطروح", "34": "شمال سيناء", "35": "جنوب سيناء", "88": "خارج الجمهورية",
-}
-
 ARABIC_TO_LATIN = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
-MIN_NATIONAL_ID_CONFIDENCE = 98
-MIN_INSURANCE_NUMBER_CONFIDENCE = 95
 
 
-def get_api_key() -> str:
+def api_key() -> str:
     try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
+        return st.secrets.get("OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
     except Exception:
-        key = ""
-    return key or os.getenv("OPENAI_API_KEY", "")
+        return os.getenv("OPENAI_API_KEY", "")
 
 
-def data_url(uploaded_file) -> str:
-    encoded = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
-    return f"data:{uploaded_file.type};base64,{encoded}"
+def image_to_data_url(image: Image.Image, quality: int = 95) -> str:
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=quality, optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
-def image_content(files, text: str) -> list[dict]:
-    content = [{"type": "input_text", "text": text}]
-    for file in files:
-        content.append({"type": "input_image", "image_url": data_url(file), "detail": "high"})
-    return content
+def open_uploaded(uploaded_file) -> Image.Image:
+    return Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
 
 
-def analyze(api_key: str, files) -> CardReaderResult:
-    client = OpenAI(api_key=api_key)
-    response = client.responses.parse(
-        model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
-        instructions=PROMPT,
-        input=[{"role": "user", "content": image_content(files, f"حلل المستندات. تاريخ اليوم: {date.today().isoformat()}")}],
-        text_format=CardReaderResult,
-    )
-    if response.output_parsed is None:
-        raise RuntimeError("لم يتم استخراج نتيجة منظمة")
-    return response.output_parsed
+def enhance_document(image: Image.Image) -> Image.Image:
+    max_side = 2200
+    scale = min(max_side / max(image.size), 1.0)
+    if scale < 1.0:
+        image = image.resize((int(image.width * scale), int(image.height * scale)), Image.Resampling.LANCZOS)
+
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    gray = ImageEnhance.Contrast(gray).enhance(1.8)
+    gray = ImageEnhance.Sharpness(gray).enhance(2.2)
+    gray = gray.filter(ImageFilter.UnsharpMask(radius=1.8, percent=170, threshold=3))
+    return gray.convert("RGB")
 
 
-def read_critical_numbers(api_key: str, files, round_number: int) -> CriticalNumbers:
-    client = OpenAI(api_key=api_key)
-    response = client.responses.parse(
-        model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
-        instructions=CRITICAL_PROMPT,
-        input=[{
-            "role": "user",
-            "content": image_content(files, f"قراءة مستقلة رقم {round_number}. انسخ الأرقام الحساسة فقط. عند أي شك أرجع null."),
-        }],
-        text_format=CriticalNumbers,
-    )
-    if response.output_parsed is None:
-        raise RuntimeError("تعذر التحقق من الأرقام الحساسة")
-    return response.output_parsed
+def national_id_crop(image: Image.Image) -> Image.Image:
+    # البطاقة المصرية يكون الرقم القومي غالبًا في الشريط السفلي يمين البطاقة.
+    w, h = image.size
+    crop = image.crop((int(w * 0.32), int(h * 0.63), int(w * 0.99), int(h * 0.94)))
+    crop = crop.resize((crop.width * 4, crop.height * 4), Image.Resampling.LANCZOS)
+    crop = ImageOps.grayscale(crop)
+    crop = ImageOps.autocontrast(crop, cutoff=1)
+    crop = ImageEnhance.Contrast(crop).enhance(2.4)
+    crop = ImageEnhance.Sharpness(crop).enhance(3.0)
+    crop = crop.filter(ImageFilter.UnsharpMask(radius=2, percent=220, threshold=2))
+    return crop.convert("RGB")
 
 
 def normalized_digits(value: str | None) -> str | None:
     if not value:
         return None
-    translated = value.translate(ARABIC_TO_LATIN)
-    cleaned = re.sub(r"\D", "", translated)
+    cleaned = re.sub(r"\D", "", value.translate(ARABIC_TO_LATIN))
     return cleaned or None
 
 
-def exact_display(value: str | None) -> str | None:
-    if not value:
+def strict_national_id(value: str | None) -> str | None:
+    cleaned = normalized_digits(value)
+    if not cleaned or len(cleaned) != 14 or cleaned[0] not in {"2", "3"}:
         return None
-    return re.sub(r"[\s\-–—]", "", value)
-
-
-def strict_consensus(
-    first: str | None,
-    second: str | None,
-    first_confidence: int,
-    second_confidence: int,
-    minimum_confidence: int,
-    expected_length: int | None = None,
-) -> str | None:
-    a = normalized_digits(first)
-    b = normalized_digits(second)
-    if not a or a != b:
-        return None
-    if first_confidence < minimum_confidence or second_confidence < minimum_confidence:
-        return None
-    if expected_length is not None and len(a) != expected_length:
-        return None
-    return exact_display(first)
-
-
-def verify_national_id(value: str | None) -> dict:
-    info = {"valid_structure": False, "birth_date": None, "age": None, "gender": None, "governorate": None, "note": None}
-    national_id = normalized_digits(value)
-    if not national_id or len(national_id) != 14:
-        info["note"] = "الرقم القومي غير مقروء بثقة كافية"
-        return info
-    century = {"2": 1900, "3": 2000}.get(national_id[0])
-    if century is None:
-        info["note"] = "الرقم القومي مرفوض: كود القرن غير صحيح"
-        return info
     try:
-        birth = date(century + int(national_id[1:3]), int(national_id[3:5]), int(national_id[5:7]))
+        century = 1900 if cleaned[0] == "2" else 2000
+        date(century + int(cleaned[1:3]), int(cleaned[3:5]), int(cleaned[5:7]))
     except ValueError:
-        info["note"] = "الرقم القومي مرفوض: تاريخ الميلاد الداخلي غير صحيح"
-        return info
-    governorate = GOVERNORATES.get(national_id[7:9])
-    if governorate is None:
-        info["note"] = "الرقم القومي مرفوض: كود المحافظة غير معروف"
-        return info
-    today = date.today()
-    age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
-    gender = "ذكر" if int(national_id[12]) % 2 else "أنثى"
-    info.update({
-        "valid_structure": True,
-        "birth_date": birth.strftime("%d/%m/%Y"),
-        "age": age,
-        "gender": gender,
-        "governorate": governorate,
-        "note": "تم التحقق من البنية والتاريخ وكود المحافظة",
-    })
-    return info
+        return None
+    return cleaned
 
 
-def show_field(label: str, item: ExtractedField, key: str) -> str:
-    return st.text_input(label, value=item.value or "", help=f"الثقة {item.confidence}% | المصدر: {item.source or 'غير محدد'}", key=key)
+def analyze_documents(key: str, insurance_file, id_file) -> tuple[ReaderResult, dict[str, Image.Image]]:
+    insurance_original = open_uploaded(insurance_file) if insurance_file else None
+    id_original = open_uploaded(id_file) if id_file else None
+
+    prepared: dict[str, Image.Image] = {}
+    content: list[dict] = [{
+        "type": "input_text",
+        "text": f"حلل المستندات التالية. تاريخ اليوم {date.today().isoformat()}. كل صورة مسبوقة بوصف يحدد وظيفتها.",
+    }]
+
+    if insurance_original:
+        insurance_enhanced = enhance_document(insurance_original)
+        prepared["insurance_enhanced"] = insurance_enhanced
+        content.extend([
+            {"type": "input_text", "text": "صورة كارنيه التأمين الأصلية:"},
+            {"type": "input_image", "image_url": image_to_data_url(insurance_original), "detail": "high"},
+            {"type": "input_text", "text": "نسخة محسنة من كارنيه التأمين لقراءة الأرقام والعناوين:"},
+            {"type": "input_image", "image_url": image_to_data_url(insurance_enhanced), "detail": "high"},
+        ])
+
+    if id_original:
+        id_enhanced = enhance_document(id_original)
+        id_number_crop = national_id_crop(id_original)
+        prepared["id_enhanced"] = id_enhanced
+        prepared["id_number_crop"] = id_number_crop
+        content.extend([
+            {"type": "input_text", "text": "صورة بطاقة الرقم القومي الأصلية:"},
+            {"type": "input_image", "image_url": image_to_data_url(id_original), "detail": "high"},
+            {"type": "input_text", "text": "نسخة محسنة من بطاقة الرقم القومي:"},
+            {"type": "input_image", "image_url": image_to_data_url(id_enhanced), "detail": "high"},
+            {"type": "input_text", "text": "قصاصة مخصصة لسطر الرقم القومي فقط. اقرأ منها 14 رقمًا أو أرجع null:"},
+            {"type": "input_image", "image_url": image_to_data_url(id_number_crop), "detail": "high"},
+        ])
+
+    client = OpenAI(api_key=key)
+    response = client.responses.parse(
+        model=os.getenv("OPENAI_MODEL", "gpt-5.1"),
+        instructions=PROMPT,
+        input=[{"role": "user", "content": content}],
+        text_format=ReaderResult,
+    )
+    if response.output_parsed is None:
+        raise RuntimeError("لم يتم استخراج نتيجة منظمة")
+    return response.output_parsed, prepared
 
 
-st.set_page_config(page_title="Hekma AI", page_icon="🧠", layout="wide")
-st.markdown("<style>html,body,[class*='css']{direction:rtl;text-align:right}.block-container{max-width:1100px;padding-top:2rem}</style>", unsafe_allow_html=True)
-st.title("🧠 Hekma AI")
-st.subheader("قارئ الكارنيه والبطاقة")
-st.caption("الأرقام الحساسة لا تُعرض إلا عند تطابق قراءتين مستقلتين بثقة مرتفعة")
+st.set_page_config(page_title="Hekma AI V2", page_icon="🧠", layout="wide")
+st.markdown(
+    "<style>html,body,[class*='css']{direction:rtl;text-align:right}.block-container{max-width:1150px;padding-top:2rem}</style>",
+    unsafe_allow_html=True,
+)
 
-api_key = get_api_key()
+st.title("🧠 Hekma AI — Vision Pipeline V2")
+st.caption("ارفع الكارنيه والبطاقة في خانات منفصلة. النظام يحسن الصور ويقص منطقة الرقم القومي تلقائيًا.")
+
 with st.sidebar:
-    st.success("API متصل") if api_key else st.error("API غير متصل")
+    st.success("API متصل") if api_key() else st.error("API غير متصل")
 
-files = st.file_uploader("اختر الصور", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
-if files:
-    columns = st.columns(min(len(files), 4))
-    for index, file in enumerate(files):
-        with columns[index % len(columns)]:
-            st.image(file, caption=file.name, use_container_width=True)
+col1, col2 = st.columns(2)
+with col1:
+    insurance_file = st.file_uploader("كارنيه التأمين", type=["png", "jpg", "jpeg", "webp"], key="insurance")
+with col2:
+    id_file = st.file_uploader("بطاقة الرقم القومي", type=["png", "jpg", "jpeg", "webp"], key="national_id")
 
-if st.button("تحليل وتدقيق الأرقام", type="primary", use_container_width=True):
-    if not api_key:
-        st.error("أضف OpenAI API Key أولًا")
-    elif not files:
-        st.error("ارفع صورة واحدة على الأقل")
+if insurance_file or id_file:
+    p1, p2 = st.columns(2)
+    if insurance_file:
+        with p1:
+            st.image(insurance_file, caption="كارنيه التأمين الأصلي", use_container_width=True)
+    if id_file:
+        with p2:
+            st.image(id_file, caption="بطاقة الرقم القومي الأصلية", use_container_width=True)
+
+if st.button("تحليل V2", type="primary", use_container_width=True):
+    if not api_key():
+        st.error("مفتاح OpenAI غير موجود")
+    elif not insurance_file and not id_file:
+        st.error("ارفع مستندًا واحدًا على الأقل")
     else:
         try:
-            with st.spinner("جاري التحليل والتحقق الصارم من الأرقام..."):
-                result = analyze(api_key, files)
-                pass1 = read_critical_numbers(api_key, files, 1)
-                pass2 = read_critical_numbers(api_key, files, 2)
-                st.session_state.result = result
-                st.session_state.pass1 = pass1
-                st.session_state.pass2 = pass2
+            with st.spinner("جاري تحسين الصور، قص مناطق الأرقام، ثم التحليل..."):
+                result, prepared = analyze_documents(api_key(), insurance_file, id_file)
+                result.national_id.value = strict_national_id(result.national_id.value)
+                if not result.national_id.value:
+                    result.national_id.confidence = 0
+                    result.warnings.append("الرقم القومي لم ينجح في التحقق الصارم؛ تم تركه فارغًا بدل عرض رقم خاطئ")
+                st.session_state.result_v2 = result
+                st.session_state.prepared_v2 = prepared
         except Exception as exc:
             st.error(f"فشل التحليل: {exc}")
 
-result = st.session_state.get("result")
-pass1 = st.session_state.get("pass1")
-pass2 = st.session_state.get("pass2")
+result = st.session_state.get("result_v2")
+prepared = st.session_state.get("prepared_v2", {})
 
-if result and pass1 and pass2:
-    verified_national_id = strict_consensus(
-        pass1.national_id,
-        pass2.national_id,
-        pass1.national_id_confidence,
-        pass2.national_id_confidence,
-        MIN_NATIONAL_ID_CONFIDENCE,
-        expected_length=14,
-    )
-    verified_member_id = strict_consensus(
-        pass1.member_id,
-        pass2.member_id,
-        pass1.member_id_confidence,
-        pass2.member_id_confidence,
-        MIN_INSURANCE_NUMBER_CONFIDENCE,
-    )
-    verified_card_number = strict_consensus(
-        pass1.card_number,
-        pass2.card_number,
-        pass1.card_number_confidence,
-        pass2.card_number_confidence,
-        MIN_INSURANCE_NUMBER_CONFIDENCE,
-    )
+if result:
+    st.success(result.summary_ar)
+    st.subheader({"valid": "🟢 الكارنيه ساري", "expired": "🔴 الكارنيه منتهي", "unknown": "🟡 الصلاحية غير واضحة"}[result.card_status])
 
-    verification = verify_national_id(verified_national_id)
-    if not verification["valid_structure"]:
-        verified_national_id = None
-        verification = verify_national_id(None)
-
-    result.national_id.value = verified_national_id
-    result.member_id.value = verified_member_id
-    result.card_number.value = verified_card_number
-
-    status = {"valid": "🟢 الكارنيه ساري", "expired": "🔴 الكارنيه منتهي", "unknown": "🟡 الصلاحية غير واضحة"}[result.card_status]
-    st.success("تم تحليل البيانات العامة. الأرقام الحساسة أدناه لا تظهر إلا عند التأكد الصارم منها.")
-    st.subheader(status)
-
-    patient_tab, insurance_tab, audit_tab, json_tab = st.tabs(["بيانات المريض", "بيانات التأمين", "تدقيق الأرقام", "JSON"])
+    patient_tab, insurance_tab, processing_tab, json_tab = st.tabs(["بيانات المريض", "بيانات التأمين", "معالجة الصور", "JSON"])
 
     with patient_tab:
         c1, c2 = st.columns(2)
-        with c1:
-            show_field("الاسم بالعربي", result.patient_name_ar, "name_ar")
-            st.text_input("الرقم القومي المؤكد", value=verified_national_id or "", key="verified_nid")
-            st.text_input("النوع", value=verification["gender"] or "غير مؤكد")
-        with c2:
-            show_field("الاسم بالإنجليزي", result.patient_name_en, "name_en")
-            st.text_input("تاريخ الميلاد", value=verification["birth_date"] or "غير مؤكد")
-            st.text_input("تطابق الأسماء", value=result.names_match)
-
-        if not verified_national_id:
-            st.error("الرقم القومي غير واضح بما يكفي. لم يتم اعتماد أو عرض أي رقم. ارفع صورة أقرب أو أوضح لسطر الرقم القومي فقط.")
+        c1.text_input("الاسم بالعربي", value=result.patient_name_ar.value or "")
+        c2.text_input("الاسم بالإنجليزي", value=result.patient_name_en.value or "")
+        st.text_input("الرقم القومي المؤكد", value=result.national_id.value or "")
+        if not result.national_id.value:
+            st.error("الرقم القومي غير مؤكد. ارفع صورة أقرب للبطاقة بدل اعتماد رقم خاطئ.")
 
     with insurance_tab:
         c1, c2 = st.columns(2)
-        with c1:
-            show_field("شركة التأمين", result.insurance_company, "company")
-            st.text_input("رقم الكارنيه المؤكد", value=verified_card_number or "", key="verified_card")
-            show_field("جهة العمل", result.employer, "employer")
-        with c2:
-            st.text_input("Member ID المؤكد", value=verified_member_id or "", key="verified_member")
-            show_field("الفئة / الشبكة", result.network_class, "network")
-            show_field("تاريخ الانتهاء", result.expiry_date, "expiry")
+        c1.text_input("شركة التأمين", value=result.insurance_company.value or "")
+        c2.text_input("جهة العمل", value=result.employer.value or "")
+        c1.text_input("Member ID", value=result.member_id.value or "")
+        c2.text_input("Card Number", value=result.card_number.value or "")
+        c1.text_input("Policy Number", value=result.policy_number.value or "")
+        c2.text_input("الفئة / الشبكة", value=result.network_class.value or "")
+        st.text_input("تاريخ الانتهاء", value=result.expiry_date.value or "")
 
-        if not verified_card_number:
-            st.warning("رقم الكارنيه لم يصل لدرجة الثقة المطلوبة؛ تُرك فارغًا بدل التخمين.")
-        if not verified_member_id:
-            st.warning("Member ID لم يصل لدرجة الثقة المطلوبة؛ تُرك فارغًا بدل التخمين.")
-
-    with audit_tab:
-        st.write("القراءة الأولى مقابل الثانية ودرجات الثقة")
-        st.dataframe({
-            "الحقل": ["الرقم القومي", "Member ID", "رقم الكارنيه"],
-            "القراءة الأولى": [pass1.national_id, pass1.member_id, pass1.card_number],
-            "ثقة الأولى": [pass1.national_id_confidence, pass1.member_id_confidence, pass1.card_number_confidence],
-            "القراءة الثانية": [pass2.national_id, pass2.member_id, pass2.card_number],
-            "ثقة الثانية": [pass2.national_id_confidence, pass2.member_id_confidence, pass2.card_number_confidence],
-            "النتيجة المعتمدة": [verified_national_id, verified_member_id, verified_card_number],
-        }, use_container_width=True)
+    with processing_tab:
+        if prepared:
+            cols = st.columns(min(len(prepared), 3))
+            for index, (name, image) in enumerate(prepared.items()):
+                with cols[index % len(cols)]:
+                    st.image(image, caption=name, use_container_width=True)
+        else:
+            st.info("لا توجد صور معالجة بعد")
 
     with json_tab:
-        st.json({
-            "general": result.model_dump(),
-            "critical_pass_1": pass1.model_dump(),
-            "critical_pass_2": pass2.model_dump(),
-            "verified": {
-                "national_id_arabic": verified_national_id,
-                "national_id_normalized": normalized_digits(verified_national_id),
-                "member_id": verified_member_id,
-                "card_number": verified_card_number,
-            },
-            "national_id_verification": verification,
-        })
+        st.json(result.model_dump())
+
+    if result.warnings:
+        st.warning("\n".join(f"• {item}" for item in dict.fromkeys(result.warnings)))
