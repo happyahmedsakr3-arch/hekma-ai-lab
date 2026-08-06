@@ -1,28 +1,39 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from typing import Optional
+
+
+class ConfidenceField(BaseModel):
+    value: Optional[str] = None
+    confidence: float = 0.0
 
 
 class CardData(BaseModel):
-    company: str | None = None
-    patient_name_ar: str | None = None
-    patient_name_en: str | None = None
-    national_id: str | None = None
-    member_id: str | None = None
-    customer_number: str | None = None
-    card_number: str | None = None
-    policy_number: str | None = None
-    expiry_date: str | None = None
-    card_valid: bool | None = None
+    company: ConfidenceField
+    patient_name_ar: ConfidenceField
+    patient_name_en: ConfidenceField
+    national_id: ConfidenceField
+    member_id: ConfidenceField
+    card_number: ConfidenceField
+    employer: ConfidenceField
+    category: ConfidenceField
+    expiry_date: ConfidenceField
+
+    card_valid: bool = False
 
 
 class DoctorRequest(BaseModel):
-    doctor_name: str | None = None
-    diagnosis: str | None = None
-    requested_service: str | None = None
-    handwritten_text: str | None = None
+    doctor_name: ConfidenceField
+    diagnosis: ConfidenceField
+    requested_service: ConfidenceField
+    handwritten_text: ConfidenceField
 
 
 class CaseAnalysis(BaseModel):
     card: CardData
-    request: DoctorRequest
-    missing_documents: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
+    request: Optional[DoctorRequest] = None
+
+    missing_documents: list[str] = []
+
+    warnings: list[str] = []
+
+    overall_confidence: float = 0.0
