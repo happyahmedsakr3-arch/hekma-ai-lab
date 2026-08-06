@@ -53,14 +53,11 @@ PROMPT = """
 1. لا تخمن. أي قيمة غير واضحة = null.
 2. فرّق بين رقم العميل وMember ID ورقم الكارنيه ورقم الوثيقة حسب العنوان المطبوع.
 3. استخرج الاسم العربي من البطاقة، والاسم الإنجليزي من كارنيه التأمين.
-4. الرقم القومي المصري لا يُقبل إلا إذا كان 14 رقمًا كاملًا وواضحًا.
-5. عند قراءة الرقم القومي، انسخه بنفس شكل الأرقام العربية المطبوعة على البطاقة دون تحويلها إلى أرقام إنجليزية.
-6. حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم.
-7. قارن الاسم العربي والإنجليزي عند وجود المستندين.
-8. لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
-9. راجع كل رقم خانة بخانة، ولا تضف أصفارًا أو تكرر رقمًا غير موجود.
-10. لا تعتبر كودًا مطبوعًا أو باركودًا رقم كارنيه دون دليل واضح من الموضع أو العنوان.
-11. أرجع نتيجة منظمة فقط.
+4. لا تعتمد الرقم القومي أو Member ID أو رقم الكارنيه في التحليل العام؛ ستتم قراءتها في مرحلة مستقلة.
+5. حدّد صلاحية الكارنيه بمقارنة تاريخ الانتهاء بتاريخ اليوم.
+6. قارن الاسم العربي والإنجليزي عند وجود المستندين.
+7. لكل قيمة أرجع المصدر ودرجة ثقة من 0 إلى 100.
+8. أرجع نتيجة منظمة فقط.
 """
 
 CRITICAL_PROMPT = """
@@ -69,15 +66,13 @@ CRITICAL_PROMPT = """
 2) Member ID المكتوب بجوار ID أو Member ID على كارنيه التأمين.
 3) Card Number وهو الرقم الآخر المطبوع على كارنيه التأمين.
 
-تعليمات الرقم القومي:
-- انقله كما هو مطبوع بالأرقام العربية: ٠١٢٣٤٥٦٧٨٩.
-- لا تحوّله إلى 0123456789.
-- اقرأ الخانات الأربع عشرة واحدة واحدة من اليمين إلى اليسار كما تظهر بصريًا، ثم أرجع السلسلة المطبوعة نفسها.
+قواعد إلزامية:
+- لا تستنتج ولا تصحح ولا تكمل رقمًا ناقصًا.
+- إذا كانت أي خانة غير واضحة أرجع null لذلك الرقم كله.
+- الرقم القومي لا يُقبل إلا إذا رأيت 14 خانة كاملة بوضوح شديد.
+- اقرأ الرقم القومي كما هو مطبوع بالأرقام العربية.
 - تجاهل أي كود لاتيني مثل LG أو باركود أو رقم تسلسلي آخر.
-
-تعليمات جميع الأرقام:
-- لا تستنتج، لا تصحح، لا تضف ولا تحذف ولا تكرر رقمًا.
-- عند الشك أرجع null بدل التخمين.
+- لا تمنح ثقة 98 أو أكثر إلا إذا كانت كل الخانات واضحة دون لبس.
 - أرجع النتيجة المنظمة فقط.
 """
 
@@ -92,6 +87,8 @@ GOVERNORATES = {
 }
 
 ARABIC_TO_LATIN = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+MIN_NATIONAL_ID_CONFIDENCE = 98
+MIN_INSURANCE_NUMBER_CONFIDENCE = 95
 
 
 def get_api_key() -> str:
@@ -134,7 +131,7 @@ def read_critical_numbers(api_key: str, files, round_number: int) -> CriticalNum
         instructions=CRITICAL_PROMPT,
         input=[{
             "role": "user",
-            "content": image_content(files, f"قراءة حرفية مستقلة رقم {round_number}. انسخ سطر الرقم القومي العربي كما هو، ثم اقرأ رقمي التأمين."),
+            "content": image_content(files, f"قراءة مستقلة رقم {round_number}. انسخ الأرقام الحساسة فقط. عند أي شك أرجع null."),
         }],
         text_format=CriticalNumbers,
     )
@@ -157,10 +154,21 @@ def exact_display(value: str | None) -> str | None:
     return re.sub(r"[\s\-–—]", "", value)
 
 
-def consensus(first: str | None, second: str | None) -> str | None:
+def strict_consensus(
+    first: str | None,
+    second: str | None,
+    first_confidence: int,
+    second_confidence: int,
+    minimum_confidence: int,
+    expected_length: int | None = None,
+) -> str | None:
     a = normalized_digits(first)
     b = normalized_digits(second)
     if not a or a != b:
+        return None
+    if first_confidence < minimum_confidence or second_confidence < minimum_confidence:
+        return None
+    if expected_length is not None and len(a) != expected_length:
         return None
     return exact_display(first)
 
@@ -169,20 +177,20 @@ def verify_national_id(value: str | None) -> dict:
     info = {"valid_structure": False, "birth_date": None, "age": None, "gender": None, "governorate": None, "note": None}
     national_id = normalized_digits(value)
     if not national_id or len(national_id) != 14:
-        info["note"] = "الرقم القومي غير مؤكد أو ليس 14 رقمًا"
+        info["note"] = "الرقم القومي غير مقروء بثقة كافية"
         return info
     century = {"2": 1900, "3": 2000}.get(national_id[0])
     if century is None:
-        info["note"] = "كود القرن غير صحيح"
+        info["note"] = "الرقم القومي مرفوض: كود القرن غير صحيح"
         return info
     try:
         birth = date(century + int(national_id[1:3]), int(national_id[3:5]), int(national_id[5:7]))
     except ValueError:
-        info["note"] = "تاريخ الميلاد داخل الرقم القومي غير صحيح"
+        info["note"] = "الرقم القومي مرفوض: تاريخ الميلاد الداخلي غير صحيح"
         return info
     governorate = GOVERNORATES.get(national_id[7:9])
     if governorate is None:
-        info["note"] = "كود المحافظة غير معروف"
+        info["note"] = "الرقم القومي مرفوض: كود المحافظة غير معروف"
         return info
     today = date.today()
     age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
@@ -206,7 +214,7 @@ st.set_page_config(page_title="Hekma AI", page_icon="🧠", layout="wide")
 st.markdown("<style>html,body,[class*='css']{direction:rtl;text-align:right}.block-container{max-width:1100px;padding-top:2rem}</style>", unsafe_allow_html=True)
 st.title("🧠 Hekma AI")
 st.subheader("قارئ الكارنيه والبطاقة")
-st.caption("لأفضل دقة: ارفع صورة قريبة وواضحة للكارنيه وصورة مستقلة للبطاقة الشخصية")
+st.caption("الأرقام الحساسة لا تُعرض إلا عند تطابق قراءتين مستقلتين بثقة مرتفعة")
 
 api_key = get_api_key()
 with st.sidebar:
@@ -226,7 +234,7 @@ if st.button("تحليل وتدقيق الأرقام", type="primary", use_conta
         st.error("ارفع صورة واحدة على الأقل")
     else:
         try:
-            with st.spinner("جاري نسخ الرقم القومي العربي حرفيًا وتدقيق أرقام التأمين..."):
+            with st.spinner("جاري التحليل والتحقق الصارم من الأرقام..."):
                 result = analyze(api_key, files)
                 pass1 = read_critical_numbers(api_key, files, 1)
                 pass2 = read_critical_numbers(api_key, files, 2)
@@ -241,13 +249,40 @@ pass1 = st.session_state.get("pass1")
 pass2 = st.session_state.get("pass2")
 
 if result and pass1 and pass2:
-    verified_national_id = consensus(pass1.national_id, pass2.national_id)
-    verified_member_id = consensus(pass1.member_id, pass2.member_id)
-    verified_card_number = consensus(pass1.card_number, pass2.card_number)
+    verified_national_id = strict_consensus(
+        pass1.national_id,
+        pass2.national_id,
+        pass1.national_id_confidence,
+        pass2.national_id_confidence,
+        MIN_NATIONAL_ID_CONFIDENCE,
+        expected_length=14,
+    )
+    verified_member_id = strict_consensus(
+        pass1.member_id,
+        pass2.member_id,
+        pass1.member_id_confidence,
+        pass2.member_id_confidence,
+        MIN_INSURANCE_NUMBER_CONFIDENCE,
+    )
+    verified_card_number = strict_consensus(
+        pass1.card_number,
+        pass2.card_number,
+        pass1.card_number_confidence,
+        pass2.card_number_confidence,
+        MIN_INSURANCE_NUMBER_CONFIDENCE,
+    )
+
     verification = verify_national_id(verified_national_id)
+    if not verification["valid_structure"]:
+        verified_national_id = None
+        verification = verify_national_id(None)
+
+    result.national_id.value = verified_national_id
+    result.member_id.value = verified_member_id
+    result.card_number.value = verified_card_number
 
     status = {"valid": "🟢 الكارنيه ساري", "expired": "🔴 الكارنيه منتهي", "unknown": "🟡 الصلاحية غير واضحة"}[result.card_status]
-    st.success(result.summary_ar)
+    st.success("تم تحليل البيانات العامة. الأرقام الحساسة أدناه لا تظهر إلا عند التأكد الصارم منها.")
     st.subheader(status)
 
     patient_tab, insurance_tab, audit_tab, json_tab = st.tabs(["بيانات المريض", "بيانات التأمين", "تدقيق الأرقام", "JSON"])
@@ -256,12 +291,15 @@ if result and pass1 and pass2:
         c1, c2 = st.columns(2)
         with c1:
             show_field("الاسم بالعربي", result.patient_name_ar, "name_ar")
-            st.text_input("الرقم القومي كما هو مكتوب بالعربي", value=verified_national_id or "", key="verified_nid")
+            st.text_input("الرقم القومي المؤكد", value=verified_national_id or "", key="verified_nid")
             st.text_input("النوع", value=verification["gender"] or "غير مؤكد")
         with c2:
             show_field("الاسم بالإنجليزي", result.patient_name_en, "name_en")
             st.text_input("تاريخ الميلاد", value=verification["birth_date"] or "غير مؤكد")
             st.text_input("تطابق الأسماء", value=result.names_match)
+
+        if not verified_national_id:
+            st.error("الرقم القومي غير واضح بما يكفي. لم يتم اعتماد أو عرض أي رقم. ارفع صورة أقرب أو أوضح لسطر الرقم القومي فقط.")
 
     with insurance_tab:
         c1, c2 = st.columns(2)
@@ -274,22 +312,21 @@ if result and pass1 and pass2:
             show_field("الفئة / الشبكة", result.network_class, "network")
             show_field("تاريخ الانتهاء", result.expiry_date, "expiry")
 
+        if not verified_card_number:
+            st.warning("رقم الكارنيه لم يصل لدرجة الثقة المطلوبة؛ تُرك فارغًا بدل التخمين.")
+        if not verified_member_id:
+            st.warning("Member ID لم يصل لدرجة الثقة المطلوبة؛ تُرك فارغًا بدل التخمين.")
+
     with audit_tab:
-        st.write("القراءة الحرفية الأولى مقابل الثانية")
+        st.write("القراءة الأولى مقابل الثانية ودرجات الثقة")
         st.dataframe({
             "الحقل": ["الرقم القومي", "Member ID", "رقم الكارنيه"],
             "القراءة الأولى": [pass1.national_id, pass1.member_id, pass1.card_number],
+            "ثقة الأولى": [pass1.national_id_confidence, pass1.member_id_confidence, pass1.card_number_confidence],
             "القراءة الثانية": [pass2.national_id, pass2.member_id, pass2.card_number],
-            "النتيجة المؤكدة": [verified_national_id, verified_member_id, verified_card_number],
+            "ثقة الثانية": [pass2.national_id_confidence, pass2.member_id_confidence, pass2.card_number_confidence],
+            "النتيجة المعتمدة": [verified_national_id, verified_member_id, verified_card_number],
         }, use_container_width=True)
-        if not verified_national_id:
-            st.error("الرقم القومي العربي لم يتطابق حرفيًا في القراءتين؛ ارفع لقطة أقرب للسطر السفلي فقط")
-        if not verified_card_number:
-            st.error("رقم الكارنيه لم يتطابق في القراءتين؛ ارفع لقطة أقرب لرقم الكارنيه فقط")
-        if verification["valid_structure"]:
-            st.success("الرقم القومي المؤكد صالح من حيث البنية والتاريخ")
-        else:
-            st.warning(verification["note"])
 
     with json_tab:
         st.json({
