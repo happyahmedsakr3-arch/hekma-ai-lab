@@ -4,43 +4,44 @@ from PIL import Image
 from src.ocr_engine import extract_insurance_text
 
 INSURANCE_WORDS = {
-    "globemed": 8,
-    "globe med": 8,
-    "axa": 8,
-    "nextcare": 8,
-    "next care": 8,
-    "metlife": 8,
-    "medright": 8,
-    "med right": 8,
-    "mednet": 8,
-    "bupa": 8,
-    "healthcare membership": 6,
-    "insurance card": 6,
-    "card number": 5,
-    "card no": 4,
-    "member id": 5,
-    "membership id": 5,
-    "policy no": 5,
-    "policy number": 5,
-    "policy holder": 4,
-    "valid until": 4,
-    "valid to": 4,
-    "expiry": 4,
+    "globemed": 10,
+    "globe med": 10,
+    "axa": 10,
+    "nextcare": 10,
+    "next care": 10,
+    "metlife": 10,
+    "medright": 10,
+    "med right": 10,
+    "mednet": 10,
+    "bupa": 10,
+    "healthcare membership": 7,
+    "insurance card": 7,
+    "card number": 6,
+    "card no": 5,
+    "member id": 6,
+    "membership id": 6,
+    "policy no": 6,
+    "policy number": 6,
+    "policy holder": 5,
+    "valid until": 5,
+    "valid to": 5,
+    "expiry": 5,
     "network": 3,
     "category": 3,
 }
 
 ID_WORDS = {
-    "جمهورية مصر العربية": 9,
-    "بطاقة تحقيق الشخصية": 9,
-    "تحقيق الشخصية": 7,
-    "الرقم القومي": 7,
+    "جمهورية مصر العربية": 10,
+    "بطاقة تحقيق الشخصية": 10,
+    "تحقيق الشخصية": 8,
+    "الرقم القومي": 8,
+    "بطاقة شخصية": 6,
     "محل الإقامة": 3,
     "العنوان": 2,
-    "المنوفية": 1,
     "القليوبية": 1,
     "القاهرة": 1,
     "الجيزة": 1,
+    "المنوفية": 1,
 }
 
 ARABIC_TO_LATIN = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -53,7 +54,7 @@ def _norm(text: str) -> str:
 def _valid_national_id_candidates(text: str) -> list[str]:
     normalized = (text or "").translate(ARABIC_TO_LATIN)
     candidates = []
-    for chunk in re.findall(r"[0-9][0-9\s.\-]{10,32}", normalized):
+    for chunk in re.findall(r"[0-9][0-9\s.\-]{10,36}", normalized):
         digits = re.sub(r"\D", "", chunk)
         windows = [digits] if len(digits) == 14 else [digits[i:i + 14] for i in range(max(0, len(digits) - 13))]
         for value in windows:
@@ -67,7 +68,7 @@ def _valid_national_id_candidates(text: str) -> list[str]:
                     candidates.append(value)
             except Exception:
                 pass
-    return candidates
+    return list(dict.fromkeys(candidates))
 
 
 def score_text(text: str) -> dict:
@@ -89,20 +90,25 @@ def score_text(text: str) -> dict:
 
     national_ids = _valid_national_id_candidates(text)
     if national_ids:
-        id_score += 10
+        id_score += 12
         id_hits.append("14-digit national-id pattern")
 
-    # Insurance cards very often contain labelled alphanumeric identifiers.
-    if re.search(r"card\s*(?:number|no)\s*[:\-]?\s*[A-Z0-9\-]{5,}", low, re.I):
-        insurance_score += 5
-    if re.search(r"\b(?:id|member\s*id)\s*[:\-]?\s*\d{5,}", low, re.I):
+    # Strong insurance numeric patterns even when labels are partly damaged by OCR.
+    if re.search(r"\b[A-Z]{1,3}\d{5,12}[A-Z0-9]*\b", text or "", re.I):
         insurance_score += 3
+        insurance_hits.append("alphanumeric card pattern")
+    if re.search(r"\b\d{7,9}\b", text or ""):
+        insurance_score += 2
+        insurance_hits.append("7-9 digit id pattern")
+    if re.search(r"(?:valid|expiry|until|to).{0,20}\d{1,2}[\-/][A-Za-z0-9]{1,4}[\-/]\d{2,4}", low, re.I):
+        insurance_score += 4
+        insurance_hits.append("validity date pattern")
 
-    if insurance_score >= 8 and id_score >= 8:
+    if insurance_score >= 5 and id_score >= 7:
         kind = "mixed"
-    elif insurance_score >= max(6, id_score + 2):
+    elif insurance_score >= max(4, id_score + 1):
         kind = "insurance"
-    elif id_score >= max(6, insurance_score + 2):
+    elif id_score >= max(5, insurance_score + 1):
         kind = "national_id"
     else:
         kind = "unknown"
@@ -122,16 +128,15 @@ def _segments(image: Image.Image) -> list[tuple[str, Image.Image]]:
     w, h = image.size
     segments = [("full", image)]
 
-    # Only split images large enough for each resulting half to remain readable.
-    if h >= 600:
+    if h >= 500:
         segments.extend([
-            ("top", image.crop((0, 0, w, int(h * 0.56)))),
-            ("bottom", image.crop((0, int(h * 0.44), w, h))),
+            ("top", image.crop((0, 0, w, int(h * 0.58)))),
+            ("bottom", image.crop((0, int(h * 0.42), w, h))),
         ])
-    if w >= 900:
+    if w >= 700:
         segments.extend([
-            ("left", image.crop((0, 0, int(w * 0.56), h))),
-            ("right", image.crop((int(w * 0.44), 0, w, h))),
+            ("left", image.crop((0, 0, int(w * 0.58), h))),
+            ("right", image.crop((int(w * 0.42), 0, w, h))),
         ])
     return segments
 
@@ -141,18 +146,13 @@ def route_image_by_text(image: Image.Image) -> dict:
     for label, segment in _segments(image):
         ocr = extract_insurance_text(segment)
         scores = score_text(ocr.get("text", ""))
-        candidates.append({
-            "label": label,
-            "image": segment,
-            "ocr": ocr,
-            **scores,
-        })
+        candidates.append({"label": label, "image": segment, "ocr": ocr, **scores})
 
     best_insurance = max(candidates, key=lambda x: x["insurance_score"])
     best_id = max(candidates, key=lambda x: x["id_score"])
 
-    insurance_ok = best_insurance["insurance_score"] >= 6
-    id_ok = best_id["id_score"] >= 6
+    insurance_ok = best_insurance["insurance_score"] >= 4
+    id_ok = best_id["id_score"] >= 5
 
     return {
         "segments": candidates,
