@@ -1,7 +1,7 @@
 import re
 from PIL import Image
 
-from src.ocr_engine import extract_insurance_text
+from src.paddle_engine import extract_insurance_text
 
 INSURANCE_WORDS = {
     "globemed": 10,
@@ -93,7 +93,6 @@ def score_text(text: str) -> dict:
         id_score += 12
         id_hits.append("14-digit national-id pattern")
 
-    # Strong insurance numeric patterns even when labels are partly damaged by OCR.
     if re.search(r"\b[A-Z]{1,3}\d{5,12}[A-Z0-9]*\b", text or "", re.I):
         insurance_score += 3
         insurance_hits.append("alphanumeric card pattern")
