@@ -10,9 +10,9 @@ from openai import OpenAI
 from PIL import Image
 from pydantic import BaseModel, Field
 
-from src.document_router import route_image
 from src.insurance_parser import build_hints
-from src.ocr_engine import extract_insurance_text, extract_national_id
+from src.ocr_engine import extract_national_id
+from src.text_router import route_image_by_text
 
 
 class FieldValue(BaseModel):
@@ -39,14 +39,18 @@ class InsuranceResult(BaseModel):
 
 INSURANCE_PROMPT = """
 أنت مراجع بيانات كارنيه تأمين طبي، وليس OCR.
-سيصلك نص Tesseract وصورة تم تصنيفها أولاً ككارنيه تأمين، ومعهما HINTS من عناوين الحقول المطبوعة.
-- لا تستخدم بيانات بطاقة الرقم القومي لملء Card Number أو Member ID أو Policy Number.
+وصلك نص OCR من الجزء الذي اختاره محرك Text-First باعتباره كارنيه التأمين، ومعه HINTS مبنية من العناوين المطبوعة.
+
+قواعد إلزامية:
+- لا تخلط بيانات بطاقة الرقم القومي مع بيانات كارنيه التأمين.
 - Card Number = فقط القيمة بجوار Card Number / Card No.
 - ID No / ID Number = حصراً في id_number.
 - Member ID = فقط إذا كان العنوان Member ID / Membership ID.
 - Policy Number = فقط إذا كان العنوان Policy No / Policy Number.
-- Policy Holder = جهة العمل/صاحب الوثيقة وليس Policy Number.
+- Policy Holder = جهة العمل/صاحب الوثيقة، وليس Policy Number.
+- احتفظ بالحروف داخل Card Number كما هي.
 - لا تخترع أي رقم. إذا لم يوجد الحقل صراحة أرجع null.
+- HINTS المأخوذة من label واضح لها أولوية، واستخدم الصورة فقط لحسم اللبس.
 """
 
 ARABIC_TO_LATIN = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
@@ -94,7 +98,10 @@ def review_insurance(image: Image.Image, ocr_text: str, hints: dict) -> Insuranc
         raise RuntimeError("OpenAI API Key غير موجود")
     client = OpenAI(api_key=api_key())
     content = [
-        {"type": "input_text", "text": f"تاريخ اليوم: {date.today().isoformat()}\n\nHINTS:\n{hints}\n\nOCR TEXT:\n{ocr_text}"},
+        {
+            "type": "input_text",
+            "text": f"تاريخ اليوم: {date.today().isoformat()}\n\nHINTS:\n{hints}\n\nOCR TEXT:\n{ocr_text}",
+        },
         {"type": "input_image", "image_url": image_url(image), "detail": "high"},
     ]
     response = client.responses.parse(
@@ -108,7 +115,7 @@ def review_insurance(image: Image.Image, ocr_text: str, hints: dict) -> Insuranc
     return response.output_parsed
 
 
-st.set_page_config(page_title="Hekma AI V4", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Hekma AI V5", page_icon="🧠", layout="wide")
 st.markdown("""
 <style>
 html,body,[class*='css']{direction:rtl;text-align:right}
@@ -116,18 +123,18 @@ html,body,[class*='css']{direction:rtl;text-align:right}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🧠 Hekma AI — Document AI V4")
-st.caption("ارفع الصور بأي ترتيب. النظام يحدد تلقائياً: بطاقة رقم قومي / كارنيه تأمين / صورة تحتوي الاثنين.")
+st.title("🧠 Hekma AI — Document AI V5")
+st.caption("Text-first: نقرأ النص أولاً، ثم نحدد نوع المستند من محتواه — الترتيب غير مهم.")
 
 with st.sidebar:
     st.info("OCR مجاني: Tesseract عربي/إنجليزي")
     st.success("GPT متصل") if api_key() else st.warning("GPT غير متصل")
 
 files = st.file_uploader(
-    "ارفع صور المستندات — الترتيب غير مهم",
+    "ارفع صورة أو عدة صور — ممكن بطاقة، كارنيه، أو صورة فيها الاتنين",
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=True,
-    key="documents_v4",
+    key="documents_v5",
 )
 
 if files:
@@ -135,74 +142,92 @@ if files:
     for i, file in enumerate(files):
         cols[i % len(cols)].image(file, caption=file.name, use_container_width=True)
 
-if st.button("تحليل المستندات تلقائياً", type="primary", use_container_width=True):
+if st.button("تحليل V5", type="primary", use_container_width=True):
     if not files:
         st.error("ارفع صورة واحدة على الأقل")
     else:
         try:
-            with st.spinner("جاري تصنيف الصور أولاً ثم تشغيل القارئ المناسب لكل مستند..."):
+            with st.spinner("جاري OCR شامل لكل صورة ثم تحديد نوع المستند من النص..."):
                 routed = []
-                insurance_images = []
-                id_images = []
+                insurance_candidates = []
+                id_candidates = []
 
                 for file in files:
                     image = open_upload(file)
-                    route = route_image(image)
+                    route = route_image_by_text(image)
                     routed.append({"name": file.name, "route": route})
+
                     if route.get("insurance_image") is not None:
-                        insurance_images.append((file.name, route["insurance_image"]))
+                        insurance_candidates.append({
+                            "name": file.name,
+                            "image": route["insurance_image"],
+                            "ocr": route.get("insurance_ocr"),
+                            "score": route.get("insurance_score", 0),
+                            "segment": route.get("insurance_segment"),
+                        })
+
                     if route.get("id_image") is not None:
-                        id_images.append((file.name, route["id_image"]))
+                        id_candidates.append({
+                            "name": file.name,
+                            "image": route["id_image"],
+                            "score": route.get("id_score", 0),
+                            "segment": route.get("id_segment"),
+                        })
 
-                # اختر أوضح نتيجة حسب درجات التصنيف، وليس ترتيب الرفع.
-                insurance_img = insurance_images[0][1] if insurance_images else None
-                id_img = id_images[0][1] if id_images else None
+                best_ins = max(insurance_candidates, key=lambda x: x["score"]) if insurance_candidates else None
+                best_id = max(id_candidates, key=lambda x: x["score"]) if id_candidates else None
 
-                insurance_ocr = insurance_result = national_result = hints = None
-                if insurance_img is not None:
-                    insurance_ocr = extract_insurance_text(insurance_img)
-                    hints = build_hints(insurance_ocr["text"])
+                insurance_img = best_ins["image"] if best_ins else None
+                id_img = best_id["image"] if best_id else None
+                insurance_ocr = best_ins["ocr"] if best_ins else None
+
+                hints = insurance_result = national_result = None
+
+                if insurance_img is not None and insurance_ocr:
+                    hints = build_hints(insurance_ocr.get("text", ""))
                     if api_key():
-                        insurance_result = review_insurance(insurance_img, insurance_ocr["text"], hints)
+                        insurance_result = review_insurance(insurance_img, insurance_ocr.get("text", ""), hints)
 
                 if id_img is not None:
                     national_result = extract_national_id(id_img)
 
-                st.session_state.v4_routed = routed
-                st.session_state.v4_insurance_img = insurance_img
-                st.session_state.v4_id_img = id_img
-                st.session_state.v4_ocr = insurance_ocr
-                st.session_state.v4_result = insurance_result
-                st.session_state.v4_national = national_result
-                st.session_state.v4_hints = hints or {}
+                st.session_state.v5_routed = routed
+                st.session_state.v5_best_ins = best_ins
+                st.session_state.v5_best_id = best_id
+                st.session_state.v5_ocr = insurance_ocr
+                st.session_state.v5_result = insurance_result
+                st.session_state.v5_national = national_result
+                st.session_state.v5_hints = hints or {}
         except Exception as exc:
             st.error(f"فشل التحليل: {exc}")
 
-routed = st.session_state.get("v4_routed", [])
-insurance_img = st.session_state.get("v4_insurance_img")
-id_img = st.session_state.get("v4_id_img")
-insurance_ocr = st.session_state.get("v4_ocr")
-insurance_result = st.session_state.get("v4_result")
-national_result = st.session_state.get("v4_national")
-hints = st.session_state.get("v4_hints", {})
+routed = st.session_state.get("v5_routed", [])
+best_ins = st.session_state.get("v5_best_ins")
+best_id = st.session_state.get("v5_best_id")
+insurance_ocr = st.session_state.get("v5_ocr")
+insurance_result = st.session_state.get("v5_result")
+national_result = st.session_state.get("v5_national")
+hints = st.session_state.get("v5_hints", {})
 
 if routed:
-    tab1, tab2, tab3, tab4 = st.tabs(["النتيجة", "تصنيف الصور", "OCR الخام", "التدقيق"])
+    tab1, tab2, tab3, tab4 = st.tabs(["النتيجة", "فهم المستندات", "OCR الخام", "التدقيق"])
 
     with tab1:
         c1, c2 = st.columns(2)
         with c1:
-            st.subheader("المستند الذي اعتبره كارنيه التأمين")
-            if insurance_img is not None:
-                st.image(insurance_img, use_container_width=True)
+            st.subheader("كارنيه التأمين المختار")
+            if best_ins:
+                st.caption(f"{best_ins['name']} — الجزء: {best_ins['segment']} — Score: {best_ins['score']}")
+                st.image(best_ins["image"], use_container_width=True)
             else:
-                st.warning("لم يتم التعرف على كارنيه تأمين")
+                st.warning("لم يجد النص مؤشرات كافية لكارنيه تأمين")
         with c2:
-            st.subheader("المستند الذي اعتبره بطاقة الرقم القومي")
-            if id_img is not None:
-                st.image(id_img, use_container_width=True)
+            st.subheader("بطاقة الرقم القومي المختارة")
+            if best_id:
+                st.caption(f"{best_id['name']} — الجزء: {best_id['segment']} — Score: {best_id['score']}")
+                st.image(best_id["image"], use_container_width=True)
             else:
-                st.warning("لم يتم التعرف على بطاقة رقم قومي")
+                st.warning("لم يجد النص مؤشرات كافية لبطاقة رقم قومي")
 
         direct_nid = national_result.get("value") if national_result else None
         card_id = insurance_result.id_number.value if insurance_result else hints.get("id_number")
@@ -210,11 +235,13 @@ if routed:
         final_nid = direct_nid or card_nid
 
         st.subheader("بيانات المريض")
-        st.text_input("الرقم القومي", value=final_nid or "", key="nid_v4")
+        st.text_input("الرقم القومي", value=final_nid or "", key="nid_v5")
         if direct_nid:
             st.success(f"الرقم القومي من البطاقة — ثقة OCR {national_result.get('confidence', 0)*100:.0f}%")
         elif card_nid:
-            st.info("الرقم القومي مأخوذ من ID No في كارنيه التأمين بعد التحقق البنيوي.")
+            st.info("تم أخذ الرقم القومي من ID No في كارنيه التأمين بعد التحقق البنيوي.")
+        elif best_id:
+            st.warning("تم التعرف على البطاقة، لكن رقمها لم ينجح في التحقق بعد.")
 
         if insurance_result:
             st.subheader("بيانات التأمين")
@@ -231,24 +258,30 @@ if routed:
             a.text_input("بداية الصلاحية", value=insurance_result.valid_from.value or hints.get("valid_from") or "")
             b.text_input("تاريخ الانتهاء", value=insurance_result.expiry_date.value or hints.get("expiry_date") or "")
             st.subheader({"valid": "🟢 ساري", "expired": "🔴 منتهي", "unknown": "🟡 غير مؤكد"}[insurance_result.card_status])
+        elif insurance_ocr:
+            st.subheader("بيانات التأمين من القواعد المباشرة")
+            st.json(hints)
 
     with tab2:
         rows = []
         for item in routed:
             route = item["route"]
-            full = route.get("full", {})
-            rows.append({
-                "الملف": item["name"],
-                "التصنيف": route.get("kind"),
-                "Insurance score": full.get("insurance_score"),
-                "National ID score": full.get("id_score"),
-            })
+            for segment in route.get("segments", []):
+                rows.append({
+                    "الملف": item["name"],
+                    "الجزء": segment.get("label"),
+                    "نوع النص": segment.get("kind"),
+                    "Insurance score": segment.get("insurance_score"),
+                    "National ID score": segment.get("id_score"),
+                    "Insurance hits": ", ".join(segment.get("insurance_hits", [])),
+                    "ID hits": ", ".join(segment.get("id_hits", [])),
+                })
         st.dataframe(rows, use_container_width=True)
-        st.caption("لو الصورة تحتوي المستندين، النظام يجرب تقسيمها أعلى/أسفل ويمين/يسار ويختار الجزء الأنسب لكل مستند.")
+        st.caption("V5 لا يفترض نوع الصورة. يعمل OCR على الصورة والأجزاء المحتملة، ثم يختار حسب محتوى النص.")
 
     with tab3:
         if insurance_ocr:
-            st.text_area("OCR كارنيه التأمين", value=insurance_ocr["text"], height=300)
+            st.text_area("OCR الجزء المختار ككارنيه تأمين", value=insurance_ocr.get("text", ""), height=320)
         if national_result:
             st.write("القراءات الخام لمنطقة الرقم القومي")
             st.dataframe(national_result.get("raw_reads", []), use_container_width=True)
