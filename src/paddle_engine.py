@@ -17,13 +17,13 @@ def normalize_digits(text: str | None) -> str:
 
 @lru_cache(maxsize=1)
 def _ocr() -> PaddleOCR:
+    # PaddleOCR 2.x: lighter and more stable on Streamlit Community Cloud.
+    # Arabic model is selected by lang='ar'.
     return PaddleOCR(
-        text_detection_model_name="PP-OCRv5_mobile_det",
-        text_recognition_model_name="arabic_PP-OCRv5_mobile_rec",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        device="cpu",
+        use_angle_cls=False,
+        lang="ar",
+        use_gpu=False,
+        show_log=False,
     )
 
 
@@ -34,46 +34,37 @@ def _prepare(image: Image.Image) -> Image.Image:
         scale = 1800 / max(w, h)
         image = image.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     image = ImageOps.autocontrast(image, cutoff=0.5)
-    image = ImageEnhance.Contrast(image).enhance(1.25)
-    image = ImageEnhance.Sharpness(image).enhance(1.35)
+    image = ImageEnhance.Contrast(image).enhance(1.2)
+    image = ImageEnhance.Sharpness(image).enhance(1.3)
     image = image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
     return image
 
 
 def _run(image: Image.Image) -> dict[str, Any]:
     prepared = _prepare(image)
-    arr = np.array(prepared)
-    outputs = list(
-        _ocr().predict(
-            arr,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            text_rec_score_thresh=0.25,
-        )
-    )
+    result = _ocr().ocr(np.array(prepared), cls=False)
 
     texts: list[str] = []
     scores: list[float] = []
     boxes: list[Any] = []
     raw: list[dict[str, Any]] = []
 
-    for out in outputs:
-        payload = out.json
-        res = payload.get("res", payload)
-        part_texts = [str(x) for x in (res.get("rec_texts") or []) if str(x).strip()]
-        part_scores = [float(x) for x in (res.get("rec_scores") or [])]
-        part_boxes = res.get("rec_boxes") or []
-        texts.extend(part_texts)
-        scores.extend(part_scores[: len(part_texts)])
+    # PaddleOCR 2.x normally returns a list per image:
+    # [[box, (text, score)], ...]
+    page = result[0] if result and isinstance(result[0], list) else result
+    for item in page or []:
         try:
-            boxes.extend(part_boxes.tolist())
+            box, rec = item
+            text, score = rec
+            text = str(text).strip()
+            if not text:
+                continue
+            texts.append(text)
+            scores.append(float(score))
+            boxes.append(box)
+            raw.append({"text": text, "confidence": float(score)})
         except Exception:
-            boxes.extend(part_boxes)
-        raw.append({
-            "texts": part_texts,
-            "scores": part_scores,
-        })
+            continue
 
     return {
         "text": "\n".join(texts),
@@ -87,11 +78,7 @@ def _run(image: Image.Image) -> dict[str, Any]:
 
 def extract_insurance_text(image: Image.Image) -> dict:
     result = _run(image)
-    lines = []
-    for idx, text in enumerate(result["texts"]):
-        score = result["scores"][idx] if idx < len(result["scores"]) else None
-        lines.append({"text": text, "confidence": score})
-    result["lines"] = lines
+    result["lines"] = result["raw"]
     return result
 
 
@@ -123,8 +110,7 @@ def _extract_candidates(text: str) -> list[str]:
 def national_id_roi(image: Image.Image) -> Image.Image:
     image = image.convert("RGB")
     w, h = image.size
-    # Egyptian ID number is normally in the lower half; keep a broad ROI to tolerate perspective/crops.
-    roi = image.crop((int(w * 0.18), int(h * 0.50), int(w * 0.995), int(h * 0.98)))
+    roi = image.crop((int(w * 0.18), int(h * 0.48), int(w * 0.995), int(h * 0.99)))
     if roi.width < 10 or roi.height < 10:
         return image
     target_w = max(2200, roi.width * 4)
@@ -149,7 +135,6 @@ def extract_national_id(image: Image.Image) -> dict:
             raw_reads.append({"source": name, "text": out["text"]})
             for value in _extract_candidates(out["text"]):
                 if _national_id_structure_ok(value):
-                    # confidence = best OCR score on this pass, not fake certainty
                     conf = max(out.get("scores") or [0.0])
                     candidates.append({"value": value, "source": name, "ocr_confidence": conf})
         except Exception as exc:
